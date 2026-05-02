@@ -1,0 +1,266 @@
+"""Search Agent — conversational discovery + ranked search + auto-shortlist.
+
+Flow:
+  1. ProfileUpdater (called from main.py before this agent) has already
+     extracted any preferences from the user message.
+  2. If profile.is_rich_enough() returns False, ask ONE clarifying
+     question instead of searching.
+  3. Otherwise: hard-filter by profile, score with RankingService,
+     return top 5, auto-add to session.shortlist.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+
+from listings import Listing, filter_listings
+from profile import RankingService, UserProfile
+
+from .base import AgentReply, BaseAgent
+
+
+CLARIFY_PROMPT = """You are RentWise's Search Agent. The user is starting an
+apartment search but you don't yet have enough info to make a useful
+recommendation.
+
+Ask ONE concise, friendly question that would most improve the search.
+Prioritize what's missing in this order:
+  1. budget (max monthly rent)
+  2. bed count (studio? 1BR? 2BR?)
+  3. location signal (commute target like a workplace, OR preferred neighborhoods)
+  4. must-haves (pets, parking, in-unit laundry, pool, etc.)
+
+Already-known profile:
+{profile_summary}
+
+User's latest message:
+"{message}"
+
+Return ONLY the question text — one or two sentences max, no preamble.
+Be specific. Example good questions:
+  - "What's your max monthly budget?"
+  - "1-bedroom or studio? Or open to either?"
+  - "Where do you work or commute to most? I can prioritize listings closer to it."
+"""
+
+
+RANK_PROMPT = """You are RentWise's Search Agent. The user's evolving profile is:
+
+{profile_json}
+
+Below are {n} candidate listings (already pre-filtered to honor hard
+budget/beds/pets constraints) with their RENT, WALK_SCORE, etc., plus
+a heuristic SCORE we've computed against this profile.
+
+Pick the BEST 5 to show the user, ranked from best to worst. Trust the
+heuristic SCORE but feel free to tie-break on qualitative factors. For
+each pick, write a SHORT one-sentence rationale that ties to the user's
+profile.
+
+Return ONLY a JSON array (no prose, no fences):
+[
+  {{"zpid": "...", "rationale": "..."}}, ...
+]
+
+If the data forced a tradeoff (e.g., over budget by 5%), prepend a single
+relax note object: {{"_note": "<short note>"}}.
+
+CANDIDATES:
+{candidates}
+"""
+
+
+def _strip_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    return text
+
+
+class SearchAgent(BaseAgent):
+    name = "search"
+
+    def __init__(self, listings: list[Listing], ranker: RankingService | None = None, **kw):
+        super().__init__(**kw)
+        self.listings = listings
+        self.by_zpid = {L.zpid: L for L in listings if L.zpid}
+        self.ranker = ranker or RankingService()
+
+    # --- conversational discovery ----------------------------------------
+
+    def _clarify(self, message: str, profile: UserProfile) -> str:
+        prompt = CLARIFY_PROMPT.format(
+            profile_summary=profile.to_summary(),
+            message=message,
+        )
+        resp = self.client.messages.create(
+            model=self.model,
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+
+    # --- ranking ---------------------------------------------------------
+
+    def _candidate_card(self, L: Listing, score) -> dict:
+        return {
+            "zpid": L.zpid,
+            "name": L.name,
+            "address": L.address,
+            "neighborhood": L.neighborhood,
+            "rent_min": L.rent_min,
+            "rent_max": L.rent_max,
+            "rent_by_bed": {
+                ("Studio" if b == 0 else f"{b}BR"): {"min": mn, "max": mx}
+                for b, (mn, mx) in L.rent_by_bed.items()
+            },
+            "walk_score": L.walk_score,
+            "transit_score": L.transit_score,
+            "pets_allowed": L.pets_allowed,
+            "url": L.url,
+            "_heuristic_score": score.overall,
+            "_heuristic_components": score.components,
+        }
+
+    def _llm_rank(self, profile: UserProfile, scored: list[tuple[Listing, "ScoreBreakdown"]]) -> tuple[list[Listing], str | None]:
+        # scored is already sorted descending by overall score; cap at 25
+        top = scored[:25]
+        cards = [self._candidate_card(L, s) for L, s in top]
+        prompt = RANK_PROMPT.format(
+            profile_json=json.dumps(asdict(profile), default=str, indent=2),
+            n=len(cards),
+            candidates=json.dumps(cards, indent=2),
+        )
+        resp = self.client.messages.create(
+            model=self.model,
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = _strip_fences(resp.content[0].text)
+        try:
+            picks = json.loads(text)
+        except json.JSONDecodeError:
+            return [L for L, _ in top[:5]], "rank parse failed; showing heuristic top 5"
+
+        note: str | None = None
+        if isinstance(picks, list) and picks and isinstance(picks[0], dict) and "_note" in picks[0]:
+            note = picks[0]["_note"]
+            picks = picks[1:]
+
+        ranked: list[Listing] = []
+        rationales: dict[str, str] = {}
+        for p in picks:
+            if not isinstance(p, dict):
+                continue
+            zpid = str(p.get("zpid", ""))
+            L = self.by_zpid.get(zpid)
+            if L is not None:
+                ranked.append(L)
+                rationales[zpid] = p.get("rationale", "")
+        if not ranked:
+            ranked = [L for L, _ in top[:5]]
+        for L in ranked:
+            L.raw["_rationale"] = rationales.get(L.zpid, "")
+        return ranked, note
+
+    # --- markdown render -------------------------------------------------
+
+    def _render(self, ranked: list[Listing], note: str | None) -> str:
+        lines: list[str] = ["**Top matches** _(also pinned to your shortlist on the right)_"]
+        if note:
+            lines.append("")
+            lines.append(f"> ⚠️ {note}")
+        lines.append("")
+        for i, L in enumerate(ranked, 1):
+            beds = ", ".join(
+                ("Studio" if b == 0 else f"{b}BR") for b in sorted(L.rent_by_bed)
+            ) or "?"
+            rent = (
+                f"${L.rent_min:,}–${L.rent_max:,}"
+                if L.rent_min and L.rent_max
+                else "rent ?"
+            )
+            loc = L.neighborhood or "—"
+            url = L.url or ""
+            rationale = L.raw.get("_rationale", "").strip()
+            lines.append(f"{i}. **{L.name}** — {rent} · {beds} · {loc}")
+            if rationale:
+                lines.append(f"   {rationale}")
+            if url:
+                lines.append(f"   [View on Zillow]({url})")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    # --- handle ----------------------------------------------------------
+
+    def handle(self, message: str, session) -> AgentReply:  # noqa: ANN001
+        profile: UserProfile = session.profile
+
+        if not profile.is_rich_enough():
+            question = self._clarify(message, profile)
+            return AgentReply(
+                agent=self.name,
+                text=question,
+                awaiting=["profile_input"],
+                metadata={
+                    "phase": "clarifying",
+                    "profile_summary": profile.to_summary(),
+                },
+            )
+
+        # Hard-filter by profile, then score everything that passes.
+        filtered = filter_listings(
+            self.listings,
+            max_rent=profile.budget_max,
+            min_beds=profile.beds_min,
+            max_beds=profile.beds_max,
+            pets=profile.pets[0] if profile.pets else None,
+            neighborhood=profile.neighborhoods[0] if profile.neighborhoods else None,
+        )
+        if not filtered:
+            # Soft-fallback: drop neighborhood filter
+            filtered = filter_listings(
+                self.listings,
+                max_rent=profile.budget_max,
+                min_beds=profile.beds_min,
+                max_beds=profile.beds_max,
+                pets=profile.pets[0] if profile.pets else None,
+            )
+            relax_msg = " (relaxed neighborhood filter to find matches)" if filtered else ""
+        else:
+            relax_msg = ""
+
+        if not filtered:
+            return AgentReply(
+                agent=self.name,
+                text=(
+                    "Nothing matched even after relaxing the neighborhood. "
+                    "Want me to widen the budget or bed count?"
+                ),
+                metadata={"phase": "no_results", "profile_summary": profile.to_summary()},
+            )
+
+        scored = [(L, self.ranker.score(L, profile)) for L in filtered]
+        scored.sort(key=lambda t: -t[1].overall)
+        ranked, note = self._llm_rank(profile, scored)
+        if relax_msg:
+            note = (note or "") + relax_msg
+
+        # Auto-add top 5 to shortlist
+        for L in ranked:
+            session.add_to_shortlist(L, via="search")
+        session.listings_in_scope = ranked
+        session.rescore_shortlist(self.ranker)
+
+        markdown = self._render(ranked, note)
+        return AgentReply(
+            agent=self.name,
+            text=markdown,
+            metadata={
+                "phase": "results",
+                "ranked_zpids": [L.zpid for L in ranked],
+                "profile_summary": profile.to_summary(),
+            },
+        )

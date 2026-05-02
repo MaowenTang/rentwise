@@ -1,0 +1,277 @@
+"""RentWise API — v0 scaffold.
+
+Per turn:
+  1. ProfileUpdater extracts revealed prefs from the user message.
+  2. Agent Router dispatches to one of 4 specialist agents.
+  3. The agent runs and may add listings to the shortlist.
+  4. Shortlist is re-scored against the (possibly updated) profile.
+  5. Response includes: reply, agent, profile summary, shortlist with scores.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import asynccontextmanager
+from dataclasses import asdict
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from agents.location import LocationCommuteAgent
+from agents.outreach import OutreachAgent
+from agents.property import PropertyAnalystAgent
+from agents.router import AgentRouter
+from agents.search import SearchAgent
+from listings import load_listings
+from profile import ProfileUpdater, RankingService
+from session import ChatTurn, SessionStore
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+LOG = logging.getLogger("rentwise.api")
+
+STATE: dict = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    LOG.info("loading listings...")
+    listings = load_listings()
+    LOG.info("loaded %d listings", len(listings))
+    ranker = RankingService()
+    STATE["listings"] = listings
+    STATE["ranker"] = ranker
+    STATE["sessions"] = SessionStore()
+    STATE["profile_updater"] = ProfileUpdater()
+    STATE["agents"] = {
+        "search": SearchAgent(listings, ranker=ranker),
+        "property": PropertyAnalystAgent(),
+        "location": LocationCommuteAgent(),
+        "outreach": OutreachAgent(),
+    }
+    STATE["router"] = AgentRouter()
+    yield
+    STATE.clear()
+
+
+app = FastAPI(title="RentWise API", version="0.0.3", lifespan=lifespan)
+
+# CORS — accept localhost (dev) + any explicit origins from CORS_ORIGINS env
+# (comma-separated). Plus any *.vercel.app preview/prod domain via regex.
+_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+_extra = os.environ.get("CORS_ORIGINS", "").strip()
+if _extra:
+    _origins += [o.strip() for o in _extra.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    agent: str
+    router_reason: str | None = None
+    metadata: dict | None = None
+    profile: dict
+    profile_summary: str
+    shortlist: list[dict]
+
+
+class ShortlistMutation(BaseModel):
+    session_id: str
+    zpid: str
+
+
+class ProfileRemoval(BaseModel):
+    """Remove or clear a profile field.
+
+    For list fields (pets, must_haves, nice_to_haves, avoid, neighborhoods),
+    pass `value` to remove a specific item. Pass `value=null` to clear
+    the whole list.
+
+    For scalar fields (budget_max, beds_min, beds_max, commute, notes),
+    pass `value=null` to clear.
+    """
+    session_id: str
+    field: str
+    value: str | None = None
+
+
+@app.get("/healthz")
+def healthz():
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    return {
+        "ok": True,
+        "listings_loaded": len(STATE.get("listings", [])),
+        "anthropic_key_present": key.startswith("sk-") and "..." not in key,
+        "agents": list(STATE.get("agents", {}).keys()),
+    }
+
+
+@app.get("/listings")
+def listings_summary():
+    L = STATE.get("listings", [])
+    return {
+        "count": len(L),
+        "sample": [
+            {"name": x.name, "address": x.address, "rent_min": x.rent_min}
+            for x in L[:5]
+        ],
+    }
+
+
+def _profile_dict(session) -> dict:  # noqa: ANN001
+    d = asdict(session.profile)
+    if d.get("commute") is None:
+        d.pop("commute", None)
+    return d
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key.startswith("sk-") or "..." in key:
+        raise HTTPException(
+            status_code=500, detail="ANTHROPIC_API_KEY not set. Edit api/.env."
+        )
+
+    sessions: SessionStore = STATE["sessions"]
+    session = sessions.get(req.session_id)
+    session.history.append(ChatTurn(role="user", agent=None, text=req.message))
+
+    # 1. Update profile from this turn (parallel-safe with router because
+    #    router doesn't read the profile, but the search agent does).
+    updater: ProfileUpdater = STATE["profile_updater"]
+    profile_before_summary = session.profile.to_summary()
+    session.profile = updater.update(req.message, session.profile)
+    profile_after_summary = session.profile.to_summary()
+    if profile_before_summary != profile_after_summary:
+        LOG.info(
+            "[%s] profile: %s → %s",
+            req.session_id[:8], profile_before_summary, profile_after_summary,
+        )
+
+    # 2. Route
+    router: AgentRouter = STATE["router"]
+    agent_id, reason = router.route(req.message, session)
+    LOG.info("[%s] route → %s (%s)", req.session_id[:8], agent_id, reason)
+
+    # 3. Dispatch
+    agent = STATE["agents"][agent_id]
+    reply = agent.handle(req.message, session)
+    session.history.append(ChatTurn(role="agent", agent=agent_id, text=reply.text))
+
+    # 3b. Track / clear pending clarification so next turn routes correctly
+    if reply.awaiting:
+        session.pending_clarification = (agent_id, reply.awaiting)
+        LOG.info("[%s] %s is awaiting %s", req.session_id[:8], agent_id, reply.awaiting)
+    else:
+        if session.pending_clarification:
+            LOG.info("[%s] cleared pending clarification", req.session_id[:8])
+        session.pending_clarification = None
+
+    # 4. Always rescore the shortlist after a turn (profile may have changed,
+    #    or new entries may have been added).
+    ranker: RankingService = STATE["ranker"]
+    session.rescore_shortlist(ranker)
+
+    return ChatResponse(
+        reply=reply.text,
+        agent=reply.agent,
+        router_reason=reason,
+        metadata=reply.metadata,
+        profile=_profile_dict(session),
+        profile_summary=session.profile.to_summary(),
+        shortlist=session.shortlist_payload(),
+    )
+
+
+@app.post("/shortlist/remove")
+def shortlist_remove(req: ShortlistMutation):
+    session = STATE["sessions"].get(req.session_id)
+    removed = session.remove_from_shortlist(req.zpid)
+    session.rescore_shortlist(STATE["ranker"])
+    return {
+        "ok": True,
+        "removed": removed,
+        "shortlist": session.shortlist_payload(),
+    }
+
+
+@app.post("/shortlist/add")
+def shortlist_add(req: ShortlistMutation):
+    session = STATE["sessions"].get(req.session_id)
+    listings = STATE["listings"]
+    target = next((L for L in listings if L.zpid == req.zpid), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="zpid not found")
+    added = session.add_to_shortlist(target, via="manual")
+    session.rescore_shortlist(STATE["ranker"])
+    return {
+        "ok": True,
+        "added": added,
+        "shortlist": session.shortlist_payload(),
+    }
+
+
+LIST_FIELDS = {"pets", "must_haves", "nice_to_haves", "avoid", "neighborhoods"}
+SCALAR_FIELDS = {"budget_max", "beds_min", "beds_max", "commute", "notes"}
+
+
+@app.post("/profile/remove")
+def profile_remove(req: ProfileRemoval):
+    session = STATE["sessions"].get(req.session_id)
+    p = session.profile
+    field = req.field
+    value = req.value
+
+    if field in LIST_FIELDS:
+        cur = getattr(p, field)
+        if value is None:
+            setattr(p, field, [])
+        else:
+            v_lower = value.lower()
+            setattr(p, field, [x for x in cur if x.lower() != v_lower])
+    elif field == "budget_max":
+        p.budget_max = None
+    elif field == "beds_min":
+        p.beds_min = None
+    elif field == "beds_max":
+        p.beds_max = None
+    elif field == "beds":  # convenience: clear both
+        p.beds_min = None
+        p.beds_max = None
+    elif field == "commute":
+        p.commute = None
+    elif field == "notes":
+        p.notes = ""
+    else:
+        raise HTTPException(status_code=400, detail=f"unknown field: {field}")
+
+    session.rescore_shortlist(STATE["ranker"])
+    return {
+        "ok": True,
+        "profile": _profile_dict(session),
+        "profile_summary": session.profile.to_summary(),
+        "shortlist": session.shortlist_payload(),
+    }
+
+
+@app.post("/session/reset")
+def reset(req: dict):
+    sid = req.get("session_id")
+    if sid:
+        STATE["sessions"].reset(sid)
+    return {"ok": True}

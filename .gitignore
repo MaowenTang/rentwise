@@ -1,0 +1,35 @@
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.local.example
+
+# Python
+api/.venv/
+api/__pycache__/
+api/agents/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Node / Next.js
+web/node_modules/
+web/.next/
+web/out/
+web/.vercel/
+
+# Logs
+*.log
+api/logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Misc local backups
+/tmp/
+*.bak
