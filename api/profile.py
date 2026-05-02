@@ -81,6 +81,11 @@ class UserProfile:
     user_name: str = ""           # for email signatures (Outreach Agent)
     move_in_date: str = ""        # ISO date or free text (Outreach Agent)
     notes: str = ""
+    # User-customized component weights from the onboarding questionnaire.
+    # When non-empty, RankingService uses these instead of DEFAULT_WEIGHTS.
+    # Keys are RankingService component names (budget / commute / pets /
+    # must_haves / walk_score / transit_score / etc.).
+    weights: dict[str, float] = field(default_factory=dict)
 
     def is_rich_enough(self) -> bool:
         """Have we collected enough signal to do a useful search?
@@ -155,7 +160,9 @@ class RankingService:
 
     def score(self, listing: Listing, profile: UserProfile) -> ScoreBreakdown:
         comps: dict[str, float] = {}
-        weights = self.DEFAULT_WEIGHTS
+        # Prefer the user's custom weights from the onboarding questionnaire,
+        # falling back to defaults for any component the user didn't rank.
+        weights = {**self.DEFAULT_WEIGHTS, **(profile.weights or {})}
 
         active_weight = 0.0
         weighted_total = 0.0

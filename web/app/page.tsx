@@ -19,6 +19,18 @@ type Message = {
   ts: number;
 };
 
+type OnboardingResult = {
+  user_name: string;
+  budget_max: number | null;
+  beds_min: number | null;
+  beds_max: number | null;
+  pets: string[];
+  commute: { name: string; address?: string; max_minutes?: number | null } | null;
+  must_haves: string[];
+  avoid: string[];
+  importance_ranking: string[];
+};
+
 type Profile = {
   budget_max?: number | null;
   beds_min?: number | null;
@@ -93,6 +105,7 @@ export default function Home() {
   const [healthOk, setHealthOk] = useState<boolean | null>(null);
   const [keyOk, setKeyOk] = useState<boolean | null>(null);
   const [listingCount, setListingCount] = useState<number | null>(null);
+  const [showOnboarding, setShowOnboarding] = useState(true);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -182,8 +195,64 @@ export default function Home() {
     }
   }
 
+  async function submitOnboarding(payload: OnboardingResult) {
+    setBusy(true);
+    try {
+      const r = await fetch(`${API}/profile/init`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, ...payload }),
+      });
+      if (!r.ok) {
+        const err = await r.text();
+        throw new Error(err);
+      }
+      const data = await r.json();
+      setProfile(data.profile || {});
+      setProfileSummary(data.profile_summary || "(no preferences yet)");
+      setShortlist(data.shortlist || []);
+      // Insert the synthetic search and its reply as visible chat turns
+      if (data.initial_message) {
+        setMessages((m) => [
+          ...m,
+          {
+            id: uid(),
+            sender: "user",
+            text: data.initial_message.user,
+            ts: Date.now(),
+          },
+          {
+            id: uid(),
+            sender: "agent",
+            agent: data.initial_message.agent as AgentId,
+            text: data.initial_message.reply,
+            ts: Date.now(),
+          },
+        ]);
+      }
+      setShowOnboarding(false);
+    } catch (e: unknown) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      setMessages((m) => [
+        ...m,
+        { id: uid(), sender: "system", text: `**Error during onboarding:** ${errMsg}`, ts: Date.now() },
+      ]);
+      setShowOnboarding(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
-    <div className="h-screen w-screen bg-stone-50 text-stone-900 grid grid-cols-[260px_1fr_400px] grid-rows-1 overflow-hidden font-sans">
+    <div className="h-screen w-screen bg-stone-50 text-stone-900 grid grid-cols-[260px_1fr_400px] grid-rows-1 overflow-hidden font-sans relative">
+      {showOnboarding && (
+        <OnboardingQuestionnaire
+          onSubmit={submitOnboarding}
+          onSkip={() => setShowOnboarding(false)}
+          busy={busy}
+        />
+      )}
+
       {/* Sidebar */}
       <aside className="border-r border-stone-200 flex flex-col min-h-0 h-full">
         <div className="px-4 py-4 border-b border-stone-200">
@@ -223,7 +292,13 @@ export default function Home() {
 
           <div className="text-xs uppercase tracking-wider text-stone-500 px-2 mt-5 mb-2 flex items-center justify-between">
             <span>What I know about you</span>
-            <span className="text-[9px] text-stone-400 normal-case">click ✕ to remove</span>
+            <button
+              onClick={() => setShowOnboarding(true)}
+              className="text-[10px] text-stone-500 hover:text-stone-900 normal-case underline-offset-2 hover:underline"
+              title="Re-open the onboarding questionnaire"
+            >
+              edit
+            </button>
           </div>
           <ProfileChips profile={profile} onRemove={removeProfileItem} />
         </nav>
@@ -477,6 +552,380 @@ function ChatInput({
         >
           Send
         </button>
+      </div>
+    </div>
+  );
+}
+
+// =====================================================================
+//   OnboardingQuestionnaire — first-visit modal that captures basics
+//   + drag-to-reorder importance ranking. The ranking maps directly to
+//   RankingService component weights server-side.
+// =====================================================================
+
+const IMPORTANCE_FEATURES: { key: string; emoji: string; label: string; hint: string }[] = [
+  { key: "budget",    emoji: "💰", label: "Affordability",     hint: "Stay well under my max budget" },
+  { key: "commute",   emoji: "🚗", label: "Short commute",      hint: "Close to work / school / family" },
+  { key: "amenities", emoji: "🛁", label: "Modern amenities",   hint: "Pool, gym, in-unit laundry, etc." },
+  { key: "pets",      emoji: "🐾", label: "Pet-friendly",       hint: "Building accepts my pet(s)" },
+  { key: "walkable",  emoji: "🏪", label: "Walkable",            hint: "Grocery, restaurants, cafes on foot" },
+  { key: "transit",   emoji: "🚆", label: "Public transit",      hint: "BART/VTA/bus access nearby" },
+];
+
+function OnboardingQuestionnaire({
+  onSubmit,
+  onSkip,
+  busy,
+}: {
+  onSubmit: (r: OnboardingResult) => void;
+  onSkip: () => void;
+  busy: boolean;
+}) {
+  const [step, setStep] = useState(1);
+  const [name, setName] = useState("");
+  const [budget, setBudget] = useState(3500);
+  const [beds, setBeds] = useState<number | null>(1); // 0=studio, 1, 2, 3+
+  const [commuteName, setCommuteName] = useState("");
+  const [pets, setPets] = useState<string[]>([]);
+  const [order, setOrder] = useState<string[]>(IMPORTANCE_FEATURES.map((f) => f.key));
+  const [musts, setMusts] = useState<string[]>([]);
+  const [avoids, setAvoids] = useState<string[]>([]);
+  const [mustInput, setMustInput] = useState("");
+  const [avoidInput, setAvoidInput] = useState("");
+
+  function togglePet(p: string) {
+    setPets((cur) => (cur.includes(p) ? cur.filter((x) => x !== p) : [...cur, p]));
+  }
+
+  function moveItem(from: number, to: number) {
+    if (to < 0 || to >= order.length || from === to) return;
+    setOrder((cur) => {
+      const next = [...cur];
+      const [m] = next.splice(from, 1);
+      next.splice(to, 0, m);
+      return next;
+    });
+  }
+
+  function addChip(value: string, list: "must" | "avoid") {
+    const v = value.trim();
+    if (!v) return;
+    if (list === "must") {
+      setMusts((cur) => (cur.includes(v) ? cur : [...cur, v]));
+      setMustInput("");
+    } else {
+      setAvoids((cur) => (cur.includes(v) ? cur : [...cur, v]));
+      setAvoidInput("");
+    }
+  }
+
+  function submit() {
+    onSubmit({
+      user_name: name.trim(),
+      budget_max: budget || null,
+      beds_min: beds,
+      beds_max: beds === 3 ? null : beds, // "3+" means open-ended upper
+      pets,
+      commute: commuteName.trim() ? { name: commuteName.trim() } : null,
+      must_haves: musts,
+      avoid: avoids,
+      importance_ranking: order,
+    });
+  }
+
+  return (
+    <div className="absolute inset-0 z-50 bg-stone-900/40 backdrop-blur-sm flex items-center justify-center p-6">
+      <div className="bg-white border border-stone-200 rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+        {/* Header */}
+        <div className="px-6 pt-6 pb-3 border-b border-stone-100">
+          <div className="flex items-baseline justify-between">
+            <div>
+              <div className="text-xl font-semibold tracking-tight text-stone-900">
+                Welcome to Rent<span className="italic font-medium" style={{fontFamily:"ui-serif, Georgia, serif"}}>Wise</span>
+              </div>
+              <div className="text-sm text-stone-500 mt-0.5">
+                A quick 30-second setup so the agents know what to look for.
+              </div>
+            </div>
+            <button
+              onClick={onSkip}
+              className="text-xs text-stone-400 hover:text-stone-700 underline-offset-2 hover:underline"
+            >
+              skip — I&apos;ll just chat
+            </button>
+          </div>
+          <div className="mt-4 flex gap-1.5">
+            {[1, 2, 3].map((s) => (
+              <div
+                key={s}
+                className={`h-1 flex-1 rounded-full transition ${
+                  s <= step ? "bg-stone-900" : "bg-stone-200"
+                }`}
+              />
+            ))}
+          </div>
+          <div className="text-[11px] uppercase tracking-wider text-stone-500 mt-2">
+            Step {step} of 3 · {step === 1 ? "Quick basics" : step === 2 ? "What matters most to you" : "Anything else?"}
+          </div>
+        </div>
+
+        {/* Body */}
+        <div className="px-6 py-5 min-h-[320px]">
+          {step === 1 && (
+            <div className="space-y-5">
+              <div>
+                <label className="text-sm font-medium text-stone-700">Your name</label>
+                <input
+                  type="text"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="So agents can sign emails on your behalf"
+                  className="mt-1 w-full px-3 py-2 border border-stone-200 rounded-md text-sm focus:outline-none focus:border-stone-900"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-stone-700">
+                  💰 Max monthly rent: <span className="font-mono font-semibold">${budget.toLocaleString()}</span>
+                </label>
+                <input
+                  type="range"
+                  min={1000}
+                  max={8000}
+                  step={50}
+                  value={budget}
+                  onChange={(e) => setBudget(Number(e.target.value))}
+                  className="mt-2 w-full accent-stone-900"
+                />
+                <div className="flex justify-between text-[10px] text-stone-400 mt-0.5 font-mono">
+                  <span>$1,000</span><span>$3,000</span><span>$5,000</span><span>$8,000+</span>
+                </div>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-stone-700">🛏️ Bedrooms</label>
+                <div className="mt-1.5 flex gap-1.5">
+                  {[
+                    { v: 0, l: "Studio" },
+                    { v: 1, l: "1BR" },
+                    { v: 2, l: "2BR" },
+                    { v: 3, l: "3BR+" },
+                  ].map((b) => (
+                    <button
+                      key={b.v}
+                      onClick={() => setBeds(b.v)}
+                      className={`px-3 py-1.5 rounded-md text-sm border transition ${
+                        beds === b.v
+                          ? "bg-stone-900 text-white border-stone-900"
+                          : "bg-white text-stone-700 border-stone-200 hover:border-stone-400"
+                      }`}
+                    >
+                      {b.l}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-stone-700">📍 Where do you commute to most?</label>
+                <input
+                  type="text"
+                  value={commuteName}
+                  onChange={(e) => setCommuteName(e.target.value)}
+                  placeholder="e.g. Apple, Google, downtown SJ, Stanford"
+                  className="mt-1 w-full px-3 py-2 border border-stone-200 rounded-md text-sm focus:outline-none focus:border-stone-900"
+                />
+                <div className="text-[11px] text-stone-400 mt-1">
+                  We&apos;ll use straight-line distance for v0 — known employers (Apple, Google, Meta, etc.) auto-resolve to coordinates.
+                </div>
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-stone-700">🐾 Pets</label>
+                <div className="mt-1.5 flex gap-1.5">
+                  {["dogs", "cats"].map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => togglePet(p)}
+                      className={`px-3 py-1.5 rounded-md text-sm border transition capitalize ${
+                        pets.includes(p)
+                          ? "bg-stone-900 text-white border-stone-900"
+                          : "bg-white text-stone-700 border-stone-200 hover:border-stone-400"
+                      }`}
+                    >
+                      {p}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => setPets([])}
+                    className={`px-3 py-1.5 rounded-md text-sm border transition ${
+                      pets.length === 0
+                        ? "bg-stone-100 text-stone-700 border-stone-300"
+                        : "text-stone-400 border-stone-200 hover:text-stone-700"
+                    }`}
+                  >
+                    No pets
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {step === 2 && (
+            <div>
+              <p className="text-sm text-stone-600 mb-4">
+                Drag to rank what matters <strong>most</strong> at the top.
+                Higher rank = stronger weight in our matching score.
+              </p>
+              <div className="space-y-1.5">
+                {order.map((key, i) => {
+                  const f = IMPORTANCE_FEATURES.find((x) => x.key === key)!;
+                  return (
+                    <div
+                      key={key}
+                      draggable
+                      onDragStart={(e) => {
+                        e.dataTransfer.setData("text/plain", String(i));
+                        e.dataTransfer.effectAllowed = "move";
+                      }}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        const from = Number(e.dataTransfer.getData("text/plain"));
+                        moveItem(from, i);
+                      }}
+                      className="flex items-center gap-3 px-3 py-2.5 bg-white border border-stone-200 rounded-md hover:border-stone-400 hover:shadow-sm cursor-grab active:cursor-grabbing transition"
+                    >
+                      <span className="text-stone-300 text-lg leading-none select-none">⋮⋮</span>
+                      <span className="text-xs font-mono text-stone-400 w-5">{i + 1}.</span>
+                      <span className="text-xl">{f.emoji}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-medium text-stone-900">{f.label}</div>
+                        <div className="text-xs text-stone-500 truncate">{f.hint}</div>
+                      </div>
+                      <div className="flex flex-col gap-0.5">
+                        <button
+                          onClick={() => moveItem(i, i - 1)}
+                          disabled={i === 0}
+                          className="text-[10px] text-stone-400 hover:text-stone-900 disabled:opacity-30 leading-none"
+                        >▲</button>
+                        <button
+                          onClick={() => moveItem(i, i + 1)}
+                          disabled={i === order.length - 1}
+                          className="text-[10px] text-stone-400 hover:text-stone-900 disabled:opacity-30 leading-none"
+                        >▼</button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {step === 3 && (
+            <div className="space-y-5">
+              <div>
+                <label className="text-sm font-medium text-stone-700">
+                  ✅ Must-haves <span className="text-stone-400 font-normal">(deal-makers)</span>
+                </label>
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {musts.map((m) => (
+                    <span
+                      key={m}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 bg-emerald-50 border border-emerald-300 text-emerald-800 rounded-full text-xs"
+                    >
+                      {m}
+                      <button
+                        onClick={() => setMusts((c) => c.filter((x) => x !== m))}
+                        className="hover:text-red-700 leading-none"
+                      >✕</button>
+                    </span>
+                  ))}
+                </div>
+                <input
+                  type="text"
+                  value={mustInput}
+                  onChange={(e) => setMustInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      addChip(mustInput, "must");
+                    }
+                  }}
+                  placeholder="e.g. in-unit laundry, parking, pool. Press Enter to add."
+                  className="mt-2 w-full px-3 py-2 border border-stone-200 rounded-md text-sm focus:outline-none focus:border-stone-900"
+                />
+              </div>
+
+              <div>
+                <label className="text-sm font-medium text-stone-700">
+                  ❌ Definitely avoid <span className="text-stone-400 font-normal">(deal-breakers)</span>
+                </label>
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {avoids.map((m) => (
+                    <span
+                      key={m}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 bg-rose-50 border border-rose-300 text-rose-800 rounded-full text-xs"
+                    >
+                      {m}
+                      <button
+                        onClick={() => setAvoids((c) => c.filter((x) => x !== m))}
+                        className="hover:text-red-700 leading-none"
+                      >✕</button>
+                    </span>
+                  ))}
+                </div>
+                <input
+                  type="text"
+                  value={avoidInput}
+                  onChange={(e) => setAvoidInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      addChip(avoidInput, "avoid");
+                    }
+                  }}
+                  placeholder="e.g. thin walls, no parking, far from transit. Press Enter to add."
+                  className="mt-2 w-full px-3 py-2 border border-stone-200 rounded-md text-sm focus:outline-none focus:border-stone-900"
+                />
+              </div>
+
+              <div className="text-xs text-stone-400 leading-relaxed pt-2 border-t border-stone-100">
+                You can edit any of this later by clicking <span className="font-mono text-stone-600">edit</span> next to &ldquo;What I know about you&rdquo; in the sidebar, or by chatting with the agents directly.
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 py-4 border-t border-stone-100 flex items-center justify-between bg-stone-50/60">
+          <button
+            onClick={() => setStep((s) => Math.max(1, s - 1))}
+            disabled={step === 1}
+            className="text-sm text-stone-600 hover:text-stone-900 disabled:opacity-30"
+          >
+            ← Back
+          </button>
+          {step < 3 ? (
+            <button
+              onClick={() => setStep((s) => s + 1)}
+              className="text-sm px-4 py-1.5 rounded-md bg-stone-900 text-white hover:bg-stone-700 transition"
+            >
+              Next →
+            </button>
+          ) : (
+            <button
+              onClick={submit}
+              disabled={busy}
+              className="text-sm px-4 py-1.5 rounded-md bg-stone-900 text-white hover:bg-stone-700 disabled:bg-stone-300 transition"
+            >
+              {busy ? "Finding matches…" : "Get my matches →"}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

@@ -94,6 +94,33 @@ class ShortlistMutation(BaseModel):
     zpid: str
 
 
+class CommuteInit(BaseModel):
+    name: str
+    address: str | None = None
+    max_minutes: int | None = None
+
+
+class OnboardingPayload(BaseModel):
+    """Result of the 3-step onboarding questionnaire.
+
+    importance_ranking is an ordered list of feature keys (most important first).
+    Maps to RankingService component weights via a fixed schedule:
+      rank 1 -> 4.0, rank 2 -> 3.0, rank 3 -> 2.0,
+      rank 4 -> 1.5, rank 5 -> 1.0, rank 6 -> 0.5
+    Recognized keys: budget, commute, pets, amenities, walkable, transit.
+    """
+    session_id: str
+    user_name: str = ""
+    budget_max: int | None = None
+    beds_min: int | None = None
+    beds_max: int | None = None
+    pets: list[str] = []
+    commute: CommuteInit | None = None
+    must_haves: list[str] = []
+    avoid: list[str] = []
+    importance_ranking: list[str] = []
+
+
 class ProfileRemoval(BaseModel):
     """Remove or clear a profile field.
 
@@ -228,6 +255,107 @@ def shortlist_add(req: ShortlistMutation):
 
 LIST_FIELDS = {"pets", "must_haves", "nice_to_haves", "avoid", "neighborhoods"}
 SCALAR_FIELDS = {"budget_max", "beds_min", "beds_max", "commute", "notes"}
+
+# Maps the 6 questionnaire feature keys to RankingService component names.
+IMPORTANCE_TO_COMPONENT: dict[str, list[str]] = {
+    "budget":    ["budget"],
+    "commute":   ["commute"],
+    "pets":      ["pets"],
+    "amenities": ["must_haves", "nice_to_haves"],
+    "walkable":  ["walk_score", "neighborhood"],
+    "transit":   ["transit_score"],
+}
+# Rank position (0-indexed) → weight value
+RANK_WEIGHTS = [4.0, 3.0, 2.0, 1.5, 1.0, 0.5]
+
+
+def _weights_from_ranking(ranking: list[str]) -> dict[str, float]:
+    """Convert importance_ranking (ordered list of feature keys) to a
+    RankingService-component → weight map."""
+    weights: dict[str, float] = {}
+    for i, feature in enumerate(ranking):
+        w = RANK_WEIGHTS[i] if i < len(RANK_WEIGHTS) else 0.5
+        for component in IMPORTANCE_TO_COMPONENT.get(feature, []):
+            weights[component] = w
+    return weights
+
+
+@app.post("/profile/init")
+def profile_init(req: OnboardingPayload):
+    """Populate session profile from the onboarding questionnaire."""
+    from profile import CommuteTarget, EMPLOYER_HQ, UserProfile
+
+    session = STATE["sessions"].get(req.session_id)
+
+    # Build a fresh profile (overwrites anything existing for clean onboarding)
+    p = UserProfile()
+    p.user_name = req.user_name.strip()
+    p.budget_max = req.budget_max
+    p.beds_min = req.beds_min
+    p.beds_max = req.beds_max
+    p.pets = list(req.pets or [])
+    p.must_haves = list(req.must_haves or [])
+    p.avoid = list(req.avoid or [])
+
+    if req.commute and req.commute.name:
+        nm = req.commute.name.strip()
+        hq = EMPLOYER_HQ.get(nm.lower())
+        if hq:
+            p.commute = CommuteTarget(
+                name=hq["name"],
+                address=hq.get("address", ""),
+                lat=hq.get("lat"),
+                lng=hq.get("lng"),
+                max_minutes=req.commute.max_minutes,
+            )
+        else:
+            p.commute = CommuteTarget(
+                name=nm,
+                address=req.commute.address or "",
+                max_minutes=req.commute.max_minutes,
+            )
+
+    if req.importance_ranking:
+        p.weights = _weights_from_ranking(req.importance_ranking)
+
+    session.profile = p
+
+    # Auto-run the search agent now that profile is fully populated.
+    # Synthesize an initial user message that summarizes their criteria.
+    parts = []
+    if p.budget_max:
+        parts.append(f"under ${p.budget_max:,}")
+    if p.beds_min is not None:
+        parts.append("studio" if p.beds_min == 0 else f"{p.beds_min}BR")
+    if p.commute:
+        parts.append(f"near {p.commute.name}")
+    if p.pets:
+        parts.append(f"allows {', '.join(p.pets).lower()}")
+    if p.must_haves:
+        parts.append(f"with {', '.join(p.must_haves[:3])}")
+    synthetic_msg = "Find me a place " + ", ".join(parts) if parts else "Show me my best matches"
+
+    session.history.append(ChatTurn(role="user", agent=None, text=synthetic_msg))
+
+    search_agent = STATE["agents"]["search"]
+    reply = search_agent.handle(synthetic_msg, session)
+    session.history.append(ChatTurn(role="agent", agent="search", text=reply.text))
+    session.pending_clarification = None
+
+    STATE["ranker"]  # ensure import path; rescore happens in agent
+    session.rescore_shortlist(STATE["ranker"])
+
+    return {
+        "ok": True,
+        "profile": _profile_dict(session),
+        "profile_summary": session.profile.to_summary(),
+        "shortlist": session.shortlist_payload(),
+        "initial_message": {
+            "user": synthetic_msg,
+            "agent": "search",
+            "reply": reply.text,
+        },
+    }
 
 
 @app.post("/profile/remove")
