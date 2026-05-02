@@ -256,9 +256,11 @@ export default function Home() {
       setProfile(data.profile || {});
       setProfileSummary(data.profile_summary || "(no preferences yet)");
       setShortlist(data.shortlist || []);
-      // Insert the synthetic search and its reply as visible chat turns,
-      // plus the post-search guidance chips (since the auto-search counts
-      // as the user's "first" search).
+      // Insert the synthetic search + reply + guidance.
+      // CRITICAL: also strip the starter chips off the welcome message —
+      // those chips ("I work at Apple, 1BR under $3500") contradict the
+      // budget/preferences the user just selected, and would confuse them
+      // by appearing alongside their actual matches.
       if (data.initial_message) {
         const newMsgs: Message[] = [
           {
@@ -285,7 +287,15 @@ export default function Home() {
           });
           setGuidanceShown(true);
         }
-        setMessages((m) => [...m, ...newMsgs]);
+        setMessages((m) => [
+          // Strip starter chips from the welcome message
+          ...m.map((msg) =>
+            msg.sender === "system" && msg.chips === STARTER_CHIPS
+              ? { ...msg, text: "Welcome to **RentWise** 👋", chips: undefined }
+              : msg,
+          ),
+          ...newMsgs,
+        ]);
       }
       setShowOnboarding(false);
     } catch (e: unknown) {
@@ -738,6 +748,23 @@ function OnboardingQuestionnaire({
   }
 
   function submit() {
+    // Flush any chip text the user typed but didn't Enter-confirm.
+    // This is the most common onboarding mistake — they type "in-unit
+    // laundry" then click the Submit button without pressing Enter,
+    // and we'd silently drop their typed value.
+    const flushedMusts = (() => {
+      const v = mustInput.trim();
+      return v && !musts.some((m) => m.toLowerCase() === v.toLowerCase())
+        ? [...musts, v]
+        : musts;
+    })();
+    const flushedAvoids = (() => {
+      const v = avoidInput.trim();
+      return v && !avoids.some((a) => a.toLowerCase() === v.toLowerCase())
+        ? [...avoids, v]
+        : avoids;
+    })();
+
     onSubmit({
       user_name: name.trim(),
       budget_max: budget || null,
@@ -745,8 +772,8 @@ function OnboardingQuestionnaire({
       beds_max: beds === 3 ? null : beds, // "3+" means open-ended upper
       pets,
       commute: commuteName.trim() ? { name: commuteName.trim() } : null,
-      must_haves: musts,
-      avoid: avoids,
+      must_haves: flushedMusts,
+      avoid: flushedAvoids,
       importance_ranking: order,
     });
   }

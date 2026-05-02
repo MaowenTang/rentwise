@@ -33,3 +33,4 @@ Thumbs.db
 # Misc local backups
 /tmp/
 *.bak
+.vercel
