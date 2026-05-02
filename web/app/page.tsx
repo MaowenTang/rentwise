@@ -100,6 +100,57 @@ function uid() {
   return Math.random().toString(36).slice(2, 10);
 }
 
+/**
+ * Cold-start-aware fetch.
+ *
+ * Render's free tier sleeps after 15min of idle and takes ~50s to wake.
+ * The browser's default fetch throws "Failed to fetch" once the network
+ * stack gives up — usually well before 50s. We:
+ *   1. Set explicit AbortController timeouts (60s first try, 90s retry).
+ *   2. Auto-retry once on any failure — most cold-start retries succeed
+ *      because the wake completed during the first attempt.
+ *   3. Translate "Failed to fetch" / aborted into a friendly message.
+ */
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  opts: { firstTimeoutMs?: number; retryTimeoutMs?: number } = {},
+): Promise<Response> {
+  const { firstTimeoutMs = 60_000, retryTimeoutMs = 90_000 } = opts;
+
+  const attempt = async (timeoutMs: number): Promise<Response> => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, { ...init, signal: ctrl.signal });
+      return r;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  try {
+    return await attempt(firstTimeoutMs);
+  } catch {
+    // Cold-start retry. Fall through to throw a friendly error if this
+    // also fails.
+    return await attempt(retryTimeoutMs);
+  }
+}
+
+function friendlyError(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (
+    msg.includes("Failed to fetch") ||
+    msg.includes("aborted") ||
+    msg.includes("NetworkError") ||
+    msg.includes("Load failed")
+  ) {
+    return "Backend is asleep and didn't wake in time. Render's free tier needs ~50s to cold-start; please try again.";
+  }
+  return msg;
+}
+
 export default function Home() {
   const sessionId = useMemo(() => uid() + uid(), []);
   const [messages, setMessages] = useState<Message[]>([
@@ -127,7 +178,10 @@ export default function Home() {
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    fetch(`${API}/healthz`)
+    // Warm-up + health check. Uses fetchWithRetry so a sleeping API still
+    // wakes up while the user is filling out the questionnaire — by the
+    // time they hit submit, the API is usually ready.
+    fetchWithRetry(`${API}/healthz`, {}, { firstTimeoutMs: 60_000, retryTimeoutMs: 90_000 })
       .then((r) => r.json())
       .then((d) => {
         setHealthOk(d.ok);
@@ -149,7 +203,7 @@ export default function Home() {
     setInput("");
     setBusy(true);
     try {
-      const r = await fetch(`${API}/chat`, {
+      const r = await fetchWithRetry(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, message: text }),
@@ -195,10 +249,9 @@ export default function Home() {
       setProfile(data.profile || {});
       setShortlist(data.shortlist || []);
     } catch (e: unknown) {
-      const errMsg = e instanceof Error ? e.message : String(e);
       setMessages((m) => [
         ...m,
-        { id: uid(), sender: "system", text: `**Error:** ${errMsg}`, ts: Date.now() },
+        { id: uid(), sender: "system", text: `**Error:** ${friendlyError(e)}`, ts: Date.now() },
       ]);
     } finally {
       setBusy(false);
@@ -212,7 +265,7 @@ export default function Home() {
 
   async function removeFromShortlist(zpid: string) {
     try {
-      const r = await fetch(`${API}/shortlist/remove`, {
+      const r = await fetchWithRetry(`${API}/shortlist/remove`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, zpid }),
@@ -226,7 +279,7 @@ export default function Home() {
 
   async function removeProfileItem(field: string, value: string | null) {
     try {
-      const r = await fetch(`${API}/profile/remove`, {
+      const r = await fetchWithRetry(`${API}/profile/remove`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, field, value }),
@@ -243,7 +296,7 @@ export default function Home() {
   async function submitOnboarding(payload: OnboardingResult) {
     setBusy(true);
     try {
-      const r = await fetch(`${API}/profile/init`, {
+      const r = await fetchWithRetry(`${API}/profile/init`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, ...payload }),
@@ -299,10 +352,14 @@ export default function Home() {
       }
       setShowOnboarding(false);
     } catch (e: unknown) {
-      const errMsg = e instanceof Error ? e.message : String(e);
       setMessages((m) => [
         ...m,
-        { id: uid(), sender: "system", text: `**Error during onboarding:** ${errMsg}`, ts: Date.now() },
+        {
+          id: uid(),
+          sender: "system",
+          text: `**Couldn't reach the backend:** ${friendlyError(e)}\n\nClick **edit** in the sidebar to retry the questionnaire.`,
+          ts: Date.now(),
+        },
       ]);
       setShowOnboarding(false);
     } finally {
