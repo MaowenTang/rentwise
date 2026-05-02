@@ -9,6 +9,7 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type AgentId = "search" | "property" | "location" | "outreach";
 type Sender = "user" | "agent" | "system";
 
+type Chip = { label: string; send: string };
 type Message = {
   id: string;
   sender: Sender;
@@ -16,8 +17,24 @@ type Message = {
   text: string;
   routerReason?: string;
   meta?: Record<string, unknown>;
+  chips?: Chip[];        // tappable starter / quick-action chips
   ts: number;
 };
+
+const STARTER_CHIPS: Chip[] = [
+  { label: "I work at Apple, 1BR under $3500", send: "I work at Apple, looking for a 1BR under $3,500" },
+  { label: "Studio in SF under $2500",          send: "Find me a studio in San Francisco under $2,500" },
+  { label: "2BR family home, good schools",     send: "2BR family home in West San Jose, near good elementary schools" },
+  { label: "Dog-friendly near Stanford",        send: "Pet-friendly 1BR near Stanford under $3,500, dog allowed" },
+];
+
+const POST_SEARCH_CHIPS: Chip[] = [
+  { label: "Compare deposits",        send: "@property compare the security deposits across these" },
+  { label: "Commute to my work",       send: "@location how's the commute from each to my work?" },
+  { label: "Nearby groceries",         send: "@location what grocery stores are near each?" },
+  { label: "Email the top one",        send: "@outreach draft an email to the first one asking about availability and a tour next week" },
+  { label: "Show cheaper options",     send: "show me cheaper options" },
+];
 
 type OnboardingResult = {
   user_name: string;
@@ -89,14 +106,12 @@ export default function Home() {
     {
       id: uid(),
       sender: "system",
-      text: [
-        "Welcome to **RentWise**. Just tell me what you're looking for in plain English — the agents will ask follow-up questions to fill in any gaps.",
-        "",
-        "_Try:_ `find me a place near Apple` — Search will ask about budget, then surface candidates and pin them to your shortlist on the right.",
-      ].join("\n"),
+      text: "Welcome to **RentWise** 👋  Tell me what you're looking for, or tap one of these to start:",
+      chips: STARTER_CHIPS,
       ts: Date.now(),
     },
   ]);
+  const [guidanceShown, setGuidanceShown] = useState(false);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [profileSummary, setProfileSummary] = useState<string>("(no preferences yet)");
@@ -126,8 +141,8 @@ export default function Home() {
   // sticks to bottom when the user is already near the bottom, so if you
   // scroll up to read history, it doesn't yank you back).
 
-  async function send() {
-    const text = input.trim();
+  async function sendText(text: string) {
+    text = text.trim();
     if (!text || busy) return;
     const userMsg: Message = { id: uid(), sender: "user", text, ts: Date.now() };
     setMessages((m) => [...m, userMsg]);
@@ -153,7 +168,29 @@ export default function Home() {
         meta: data.metadata,
         ts: Date.now(),
       };
-      setMessages((m) => [...m, agentMsg]);
+      const newMessages: Message[] = [agentMsg];
+
+      // Post-search guidance: first time the Search Agent returns ranked
+      // results, append a system message with quick-action chips so the user
+      // knows what they can do next (other agents, refinements, outreach).
+      const phase = (data.metadata as { phase?: string } | undefined)?.phase;
+      if (
+        !guidanceShown &&
+        data.agent === "search" &&
+        phase === "results" &&
+        (data.shortlist?.length ?? 0) > 0
+      ) {
+        newMessages.push({
+          id: uid(),
+          sender: "system",
+          text: "💡 **What you can do next** — tap one or just type:",
+          chips: POST_SEARCH_CHIPS,
+          ts: Date.now() + 1,
+        });
+        setGuidanceShown(true);
+      }
+
+      setMessages((m) => [...m, ...newMessages]);
       setProfileSummary(data.profile_summary || "(no preferences yet)");
       setProfile(data.profile || {});
       setShortlist(data.shortlist || []);
@@ -166,6 +203,11 @@ export default function Home() {
     } finally {
       setBusy(false);
     }
+  }
+
+  // Backwards-compatible alias used by the existing ChatInput component.
+  function send() {
+    sendText(input);
   }
 
   async function removeFromShortlist(zpid: string) {
@@ -214,10 +256,11 @@ export default function Home() {
       setProfile(data.profile || {});
       setProfileSummary(data.profile_summary || "(no preferences yet)");
       setShortlist(data.shortlist || []);
-      // Insert the synthetic search and its reply as visible chat turns
+      // Insert the synthetic search and its reply as visible chat turns,
+      // plus the post-search guidance chips (since the auto-search counts
+      // as the user's "first" search).
       if (data.initial_message) {
-        setMessages((m) => [
-          ...m,
+        const newMsgs: Message[] = [
           {
             id: uid(),
             sender: "user",
@@ -229,9 +272,20 @@ export default function Home() {
             sender: "agent",
             agent: data.initial_message.agent as AgentId,
             text: data.initial_message.reply,
-            ts: Date.now(),
+            ts: Date.now() + 1,
           },
-        ]);
+        ];
+        if (!guidanceShown && (data.shortlist?.length ?? 0) > 0) {
+          newMsgs.push({
+            id: uid(),
+            sender: "system",
+            text: "💡 **What you can do next** — tap one or just type:",
+            chips: POST_SEARCH_CHIPS,
+            ts: Date.now() + 2,
+          });
+          setGuidanceShown(true);
+        }
+        setMessages((m) => [...m, ...newMsgs]);
       }
       setShowOnboarding(false);
     } catch (e: unknown) {
@@ -392,7 +446,7 @@ export default function Home() {
           </div>
         </header>
 
-        <ChatScroll messages={messages} busy={busy} endRef={endRef} />
+        <ChatScroll messages={messages} busy={busy} endRef={endRef} onChipTap={sendText} />
 
         <ChatInput input={input} setInput={setInput} onSend={send} busy={busy} />
       </main>
@@ -413,10 +467,12 @@ function ChatScroll({
   messages,
   busy,
   endRef,
+  onChipTap,
 }: {
   messages: Message[];
   busy: boolean;
   endRef: React.RefObject<HTMLDivElement | null>;
+  onChipTap: (text: string) => void;
 }) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const [stickToBottom, setStickToBottom] = useState(true);
@@ -445,7 +501,7 @@ function ChatScroll({
       className="flex-1 min-h-0 overflow-y-auto px-6 py-6 space-y-5"
     >
       {messages.map((m) => (
-        <MessageRow key={m.id} m={m} />
+        <MessageRow key={m.id} m={m} onChipTap={onChipTap} busy={busy} />
       ))}
       {busy && (
         <div className="text-sm text-stone-500 italic flex items-center gap-2">
@@ -1258,11 +1314,34 @@ function ShortlistCard({
   );
 }
 
-function MessageRow({ m }: { m: Message }) {
+function MessageRow({
+  m,
+  onChipTap,
+  busy,
+}: {
+  m: Message;
+  onChipTap: (text: string) => void;
+  busy: boolean;
+}) {
   if (m.sender === "system") {
     return (
       <div className="text-sm text-stone-600 border-l-2 border-stone-300 pl-3 py-1 prose prose-stone prose-sm max-w-none">
         <Markdown text={m.text} />
+        {m.chips && m.chips.length > 0 && (
+          <div className="not-prose mt-2 flex flex-wrap gap-1.5">
+            {m.chips.map((c, i) => (
+              <button
+                key={i}
+                onClick={() => onChipTap(c.send)}
+                disabled={busy}
+                className="text-xs px-3 py-1.5 rounded-full bg-white border border-stone-300 text-stone-800 hover:border-stone-900 hover:bg-stone-50 disabled:opacity-50 disabled:cursor-not-allowed transition"
+                title={c.send}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     );
   }
