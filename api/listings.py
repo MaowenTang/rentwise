@@ -151,9 +151,17 @@ def _normalize_single_home_raw(rec: dict[str, Any]) -> dict[str, Any]:
     )
 
     # --- Pricing ---
-    price = prop.get("baseRent") or prop.get("price")
-    rent_min = price if isinstance(price, (int, float)) else None
-    rent_max = rent_min  # single home → fixed rent
+    # IMPORTANT: only trust `baseRent` (the rental field). DO NOT fall back to
+    # `price` — for some listings `price` carries the sale price ($1-4M) even
+    # when homeStatus is FOR_RENT, which would pollute results.
+    base_rent = prop.get("baseRent")
+    if isinstance(base_rent, (int, float)) and 200 <= base_rent <= 30000:
+        rent_min = int(base_rent)
+        rent_max = rent_min
+    else:
+        # Treat as missing — better to skip than to lie.
+        rent_min = None
+        rent_max = None
 
     # Build a single rent_by_bed_type entry so downstream filters work
     bedrooms = prop.get("bedrooms")
@@ -487,8 +495,13 @@ def filter_listings(
 ) -> list[Listing]:
     out: list[Listing] = []
     for L in listings:
-        if max_rent is not None and L.rent_min is not None and L.rent_min > max_rent:
-            continue
+        if max_rent is not None:
+            # If user specified a budget, REJECT listings without known rent.
+            # Better to lose recall than to surface a $2M home in a $2k search.
+            if L.rent_min is None:
+                continue
+            if L.rent_min > max_rent:
+                continue
         if min_beds is not None and L.rent_by_bed:
             if not any(b >= min_beds for b in L.rent_by_bed):
                 continue
