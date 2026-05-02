@@ -106,6 +106,9 @@ export default function Home() {
   const [keyOk, setKeyOk] = useState<boolean | null>(null);
   const [listingCount, setListingCount] = useState<number | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(true);
+  // Mobile drawer state — both default-closed; only used below md breakpoint.
+  const [leftOpen, setLeftOpen] = useState(false);
+  const [rightOpen, setRightOpen] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -244,7 +247,7 @@ export default function Home() {
   }
 
   return (
-    <div className="h-screen w-screen bg-stone-50 text-stone-900 grid grid-cols-[260px_1fr_400px] grid-rows-1 overflow-hidden font-sans relative">
+    <div className="h-[100dvh] w-screen bg-stone-50 text-stone-900 flex md:grid md:grid-cols-[260px_1fr_400px] md:grid-rows-1 overflow-hidden font-sans relative">
       {showOnboarding && (
         <OnboardingQuestionnaire
           onSubmit={submitOnboarding}
@@ -253,8 +256,28 @@ export default function Home() {
         />
       )}
 
-      {/* Sidebar */}
-      <aside className="border-r border-stone-200 flex flex-col min-h-0 h-full">
+      {/* Mobile drawer backdrop */}
+      {(leftOpen || rightOpen) && (
+        <button
+          onClick={() => {
+            setLeftOpen(false);
+            setRightOpen(false);
+          }}
+          className="md:hidden fixed inset-0 bg-stone-900/30 backdrop-blur-sm z-30"
+          aria-label="Close drawer"
+        />
+      )}
+
+      {/* Sidebar — desktop column / mobile slide-over drawer */}
+      <aside
+        className={`
+          border-r border-stone-200 flex flex-col min-h-0 bg-stone-50
+          md:static md:h-full md:translate-x-0 md:w-auto md:z-auto md:shadow-none
+          fixed top-0 bottom-0 left-0 w-[80vw] max-w-[300px] z-40 shadow-2xl
+          transition-transform duration-200 ease-out
+          ${leftOpen ? "translate-x-0" : "-translate-x-full"}
+        `}
+      >
         <div className="px-4 py-4 border-b border-stone-200">
           <div className="text-lg font-semibold tracking-tight text-stone-900">
             Rent<span className="italic font-medium" style={{fontFamily:"ui-serif, 'Iowan Old Style', Georgia, serif"}}>Wise</span>
@@ -322,8 +345,45 @@ export default function Home() {
       </aside>
 
       {/* Main chat */}
-      <main className="flex flex-col min-w-0 min-h-0 h-full">
-        <header className="border-b border-stone-200 px-6 py-3 flex items-center gap-3 shrink-0">
+      <main className="flex flex-col min-w-0 min-h-0 h-full flex-1 w-full">
+        {/* Mobile-only top bar with drawer triggers */}
+        <header className="md:hidden border-b border-stone-200 px-3 py-2.5 flex items-center gap-2 shrink-0 bg-white">
+          <button
+            onClick={() => setLeftOpen(true)}
+            className="w-9 h-9 rounded-md hover:bg-stone-100 flex items-center justify-center text-stone-700"
+            aria-label="Open menu"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <line x1="3" y1="6" x2="21" y2="6"/>
+              <line x1="3" y1="12" x2="21" y2="12"/>
+              <line x1="3" y1="18" x2="21" y2="18"/>
+            </svg>
+          </button>
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold tracking-tight truncate">
+              Rent<span className="italic font-medium" style={{fontFamily:"ui-serif, Georgia, serif"}}>Wise</span>
+            </div>
+            <div className="text-[10px] uppercase tracking-wider text-stone-500">
+              {listingCount != null ? `${listingCount.toLocaleString()} listings` : "Bay Area"}
+            </div>
+          </div>
+          <button
+            onClick={() => setRightOpen(true)}
+            className="relative px-3 h-9 rounded-md bg-stone-100 hover:bg-stone-200 flex items-center gap-1.5 text-xs font-medium text-stone-800"
+            aria-label="Open shortlist"
+          >
+            <span>📋</span>
+            <span>Shortlist</span>
+            {shortlist.length > 0 && (
+              <span className="ml-0.5 inline-flex items-center justify-center w-5 h-5 rounded-full bg-stone-900 text-white text-[10px] font-mono">
+                {shortlist.length}
+              </span>
+            )}
+          </button>
+        </header>
+
+        {/* Desktop-only header */}
+        <header className="hidden md:flex border-b border-stone-200 px-6 py-3 items-center gap-3 shrink-0">
           <div className="text-sm font-medium">#general</div>
           <div className="text-xs text-stone-500">
             4 agents
@@ -337,11 +397,13 @@ export default function Home() {
         <ChatInput input={input} setInput={setInput} onSend={send} busy={busy} />
       </main>
 
-      {/* Right rail: live shortlist */}
+      {/* Right rail — desktop column / mobile slide-over drawer */}
       <ShortlistRail
         items={shortlist}
         profileSummary={profileSummary}
         onRemove={removeFromShortlist}
+        mobileOpen={rightOpen}
+        onMobileClose={() => setRightOpen(false)}
       />
     </div>
   );
@@ -1024,14 +1086,38 @@ function ShortlistRail({
   items,
   profileSummary,
   onRemove,
+  mobileOpen,
+  onMobileClose,
 }: {
   items: ShortlistItem[];
   profileSummary: string;
   onRemove: (zpid: string) => void;
+  mobileOpen: boolean;
+  onMobileClose: () => void;
 }) {
   return (
-    <aside className="border-l border-stone-200 flex flex-col min-h-0 h-full bg-stone-50">
-      <div className="px-4 py-3 border-b border-stone-200 flex items-baseline justify-between">
+    <aside
+      className={`
+        border-l border-stone-200 flex flex-col min-h-0 bg-stone-50
+        md:static md:h-full md:translate-x-0 md:w-auto md:z-auto md:shadow-none
+        fixed top-0 bottom-0 right-0 w-[90vw] max-w-[420px] z-40 shadow-2xl
+        transition-transform duration-200 ease-out
+        ${mobileOpen ? "translate-x-0" : "translate-x-full"}
+        md:!translate-x-0
+      `}
+    >
+      {/* Mobile-only close button */}
+      <div className="md:hidden flex items-center justify-between px-4 py-2.5 border-b border-stone-200">
+        <span className="text-sm font-semibold">Your shortlist</span>
+        <button
+          onClick={onMobileClose}
+          className="w-8 h-8 rounded-md hover:bg-stone-100 flex items-center justify-center text-stone-700"
+          aria-label="Close"
+        >
+          ✕
+        </button>
+      </div>
+      <div className="hidden md:flex px-4 py-3 border-b border-stone-200 items-baseline justify-between">
         <div>
           <div className="text-sm font-semibold tracking-tight">Your shortlist</div>
           <div className="text-xs text-stone-500">
