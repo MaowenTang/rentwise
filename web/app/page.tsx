@@ -522,6 +522,7 @@ export default function Home() {
       <ShortlistRail
         items={shortlist}
         profileSummary={profileSummary}
+        profile={profile}
         onRemove={removeFromShortlist}
         mobileOpen={rightOpen}
         onMobileClose={() => setRightOpen(false)}
@@ -1225,12 +1226,14 @@ function ProfileChips({
 function ShortlistRail({
   items,
   profileSummary,
+  profile,
   onRemove,
   mobileOpen,
   onMobileClose,
 }: {
   items: ShortlistItem[];
   profileSummary: string;
+  profile: Profile;
   onRemove: (zpid: string) => void;
   mobileOpen: boolean;
   onMobileClose: () => void;
@@ -1286,6 +1289,8 @@ function ShortlistRail({
               key={it.zpid}
               item={it}
               rank={i + 1}
+              userBedsMin={profile.beds_min ?? null}
+              userBedsMax={profile.beds_max ?? null}
               onRemove={() => onRemove(it.zpid)}
             />
           ))
@@ -1298,10 +1303,14 @@ function ShortlistRail({
 function ShortlistCard({
   item,
   rank,
+  userBedsMin,
+  userBedsMax,
   onRemove,
 }: {
   item: ShortlistItem;
   rank: number;
+  userBedsMin: number | null;
+  userBedsMax: number | null;
   onRemove: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -1313,13 +1322,33 @@ function ShortlistCard({
         ? "text-sky-700 border-sky-300 bg-sky-50"
         : "text-stone-600 border-stone-200";
 
-  const beds = Object.keys(item.rent_by_bed).join(", ") || "?";
-  const rent =
-    item.rent_min && item.rent_max && item.rent_min !== item.rent_max
-      ? `$${item.rent_min.toLocaleString()}–$${item.rent_max.toLocaleString()}`
-      : item.rent_min
-        ? `from $${item.rent_min.toLocaleString()}`
-        : "rent ?";
+  // Per-bed-type price rows, FILTERED to the user's bed preference.
+  // If user asked for 1BR, only the 1BR row shows — even if the complex
+  // also has Studio / 2BR / 3BR. Listing still surfaced because it has
+  // a 1BR; we just hide the rows that don't match the request.
+  const BED_ORDER = ["Studio", "1BR", "2BR", "3BR", "4BR", "5BR", "6BR"];
+  const labelToBeds = (label: string) =>
+    label === "Studio" ? 0 : parseInt(label, 10);
+
+  const allEntries = Object.entries(item.rent_by_bed).sort(
+    (a, b) => BED_ORDER.indexOf(a[0]) - BED_ORDER.indexOf(b[0]),
+  );
+  const filteredEntries = allEntries.filter(([label]) => {
+    const b = labelToBeds(label);
+    if (userBedsMin !== null && b < userBedsMin) return false;
+    if (userBedsMax !== null && b > userBedsMax) return false;
+    return true;
+  });
+  // Fallback: if the filter wiped out everything (shouldn't happen since
+  // listing passed the hard filter), show all.
+  const bedEntries = filteredEntries.length > 0 ? filteredEntries : allEntries;
+
+  function fmtRange(min: number | null, max: number | null): string {
+    if (min && max && min !== max) return `$${min.toLocaleString()}–$${max.toLocaleString()}`;
+    if (min && max) return `$${min.toLocaleString()}`;
+    if (min) return `from $${min.toLocaleString()}`;
+    return "?";
+  }
 
   const components = Object.entries(item.score_components || {})
     .sort((a, b) => b[1] - a[1]);
@@ -1341,9 +1370,21 @@ function ShortlistCard({
             {item.name}
           </div>
           <div className="text-xs text-stone-500 truncate">
-            {item.neighborhood || "—"} · {beds}
+            {item.neighborhood || "—"}
           </div>
-          <div className="text-xs text-stone-600 mt-0.5">{rent}</div>
+          <div className="mt-1 space-y-0.5">
+            {bedEntries.map(([label, range]) => (
+              <div
+                key={label}
+                className="flex items-baseline gap-2 text-xs"
+              >
+                <span className="text-stone-500 w-12 shrink-0">{label}</span>
+                <span className="text-stone-800 font-medium">
+                  {fmtRange(range.min, range.max)}
+                </span>
+              </div>
+            ))}
+          </div>
           <div className="flex items-center gap-2 mt-1.5 text-[10px] text-stone-500">
             {item.walk_score != null && <span>walk {item.walk_score}</span>}
             {item.transit_score != null && <span>transit {item.transit_score}</span>}

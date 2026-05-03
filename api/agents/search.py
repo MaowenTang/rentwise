@@ -167,28 +167,51 @@ class SearchAgent(BaseAgent):
 
     # --- markdown render -------------------------------------------------
 
-    def _render(self, ranked: list[Listing], note: str | None) -> str:
+    def _render(self, ranked: list[Listing], note: str | None, profile: UserProfile) -> str:
         lines: list[str] = ["**Top matches** _(also pinned to your shortlist on the right)_"]
         if note:
             lines.append("")
             lines.append(f"> ⚠️ {note}")
         lines.append("")
+
+        # Precise bed targeting: if the user asked for 1BR specifically,
+        # only show the 1BR row (not Studio / 2BR / 3BR rows that the
+        # complex also has). Listing still passes the hard filter because
+        # it offers 1BR — we just don't clutter the card with irrelevant
+        # bed types.
+        u_min = profile.beds_min
+        u_max = profile.beds_max
+        any_pref = u_min is not None or u_max is not None
+
         for i, L in enumerate(ranked, 1):
-            beds = ", ".join(
-                ("Studio" if b == 0 else f"{b}BR") for b in sorted(L.rent_by_bed)
-            ) or "?"
-            if L.rent_min and L.rent_max and L.rent_min != L.rent_max:
-                rent = f"${L.rent_min:,}–${L.rent_max:,}"
-            elif L.rent_min and L.rent_max:
-                rent = f"${L.rent_min:,}"
-            elif L.rent_min:
-                rent = f"from ${L.rent_min:,}"
-            else:
-                rent = "rent ?"
             loc = L.neighborhood or "—"
             url = L.url or ""
             rationale = L.raw.get("_rationale", "").strip()
-            lines.append(f"{i}. **{L.name}** — {rent} · {beds} · {loc}")
+
+            beds_in_scope = sorted(L.rent_by_bed)
+            if any_pref:
+                lo = u_min if u_min is not None else min(beds_in_scope, default=0)
+                hi = u_max if u_max is not None else max(beds_in_scope, default=99)
+                beds_to_show = [b for b in beds_in_scope if lo <= b <= hi] or beds_in_scope
+            else:
+                beds_to_show = beds_in_scope
+
+            bed_lines: list[str] = []
+            for b in beds_to_show:
+                mn, mx = L.rent_by_bed[b]
+                label = "Studio" if b == 0 else f"{b}BR"
+                if mn and mx and mn != mx:
+                    bed_lines.append(f"{label} ${mn:,}–${mx:,}")
+                elif mn and mx:
+                    bed_lines.append(f"{label} ${mn:,}")
+                elif mn:
+                    bed_lines.append(f"{label} from ${mn:,}")
+                else:
+                    bed_lines.append(f"{label} rent ?")
+            bed_str = " · ".join(bed_lines) if bed_lines else "rent ?"
+
+            lines.append(f"{i}. **{L.name}** · {loc}")
+            lines.append(f"   {bed_str}")
             if rationale:
                 lines.append(f"   {rationale}")
             if url:
@@ -257,7 +280,7 @@ class SearchAgent(BaseAgent):
         session.listings_in_scope = ranked
         session.rescore_shortlist(self.ranker)
 
-        markdown = self._render(ranked, note)
+        markdown = self._render(ranked, note, profile)
         return AgentReply(
             agent=self.name,
             text=markdown,
