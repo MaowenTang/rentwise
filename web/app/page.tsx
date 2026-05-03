@@ -764,6 +764,7 @@ const IMPORTANCE_FEATURES: { key: string; emoji: string; label: string; hint: st
   { key: "pets",      emoji: "🐾", label: "Pet-friendly",       hint: "Building accepts my pet(s)" },
   { key: "walkable",  emoji: "🏪", label: "Walkable",            hint: "Grocery, restaurants, cafes on foot" },
   { key: "transit",   emoji: "🚆", label: "Public transit",      hint: "BART/VTA/bus access nearby" },
+  { key: "quiet",     emoji: "🤫", label: "Quiet neighborhood",  hint: "Low street/traffic noise (Soundscore)" },
 ];
 
 function OnboardingQuestionnaire({

@@ -353,6 +353,9 @@ IMPORTANCE_TO_COMPONENT: dict[str, list[str]] = {
     "amenities": ["must_haves", "nice_to_haves"],
     "walkable":  ["walk_score", "neighborhood"],
     "transit":   ["transit_score"],
+    # New in Tier 2: HowLoud Soundscore from apartments.com — boosts
+    # listings in quiet locations when the user marks "quiet" as important.
+    "quiet":     ["sound_score"],
 }
 # Rank position (0-indexed) → weight value
 RANK_WEIGHTS = [4.0, 3.0, 2.0, 1.5, 1.0, 0.5]

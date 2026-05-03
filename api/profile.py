@@ -156,6 +156,11 @@ class RankingService:
         "walk_score": 1.0,
         "transit_score": 0.5,
         "neighborhood": 1.5,
+        # Sound score (HowLoud Soundscore via apartments.com): 0=very loud,
+        # 100=very quiet. We invert and rescale: quiet listings score high.
+        # Default weight is small; users who pick "quiet" in onboarding get
+        # this bumped via profile.weights.
+        "sound_score": 0.8,
     }
 
     def score(self, listing: Listing, profile: UserProfile) -> ScoreBreakdown:
@@ -277,6 +282,17 @@ class RankingService:
             comps["neighborhood"] = round(s, 1)
             active_weight += weights["neighborhood"]
             weighted_total += s * weights["neighborhood"]
+
+        # Sound score (HowLoud Soundscore via apartments.com).
+        # Range 0-100 where 100 = very quiet. Scale linearly to 0-10.
+        # Component is active whenever the listing has the data — the
+        # weight (small by default) controls how much it matters; users
+        # who care about quiet bump it via the onboarding ranking.
+        if listing.sound_score is not None:
+            s = max(0.0, min(10.0, listing.sound_score / 10))
+            comps["sound_score"] = round(s, 1)
+            active_weight += weights["sound_score"]
+            weighted_total += s * weights["sound_score"]
 
         overall = (weighted_total / active_weight) * 10 if active_weight else 50.0
         explanation = self._explain(comps)

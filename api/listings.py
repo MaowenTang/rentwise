@@ -35,6 +35,8 @@ class Listing:
     walk_score: int | None
     transit_score: int | None
     bike_score: int | None
+    sound_score: int | None = None  # HowLoud Soundscore (0=loud, 100=quiet)
+    sound_label: str | None = None  # "Calm" | "Active" | "Busy"
     pets_allowed: list[str] = field(default_factory=list)
     has_pool: bool = False
     has_elevator: bool | None = None
@@ -77,6 +79,8 @@ class Listing:
             walk_score=rec.get("walk_score"),
             transit_score=rec.get("transit_score"),
             bike_score=rec.get("bike_score"),
+            sound_score=rec.get("sound_score"),
+            sound_label=rec.get("sound_label"),
             pets_allowed=rec.get("pets_allowed") or [],
             has_pool=bool(rec.get("has_pool")),
             has_elevator=rec.get("has_elevator"),

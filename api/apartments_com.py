@@ -152,6 +152,32 @@ def _merge_into(zillow: Listing, apt: dict) -> None:
     zillow.raw["apartments_com_url"] = apt.get("url")
     zillow.raw["apartments_com_id"] = apt.get("lot_id")
 
+    # Tier-2 detail-page fields (apartments.com is authoritative for
+    # sound_score; for walk/transit/bike Zillow is fine, only fill if
+    # the Zillow side is missing).
+    if apt.get("sound_score") is not None:
+        zillow.sound_score = apt["sound_score"]
+    if apt.get("sound_label"):
+        zillow.sound_label = apt["sound_label"]
+    if zillow.walk_score is None and apt.get("walk_score") is not None:
+        zillow.walk_score = apt["walk_score"]
+    if zillow.transit_score is None and apt.get("transit_score") is not None:
+        zillow.transit_score = apt["transit_score"]
+    if zillow.bike_score is None and apt.get("bike_score") is not None:
+        zillow.bike_score = apt["bike_score"]
+    # Lat/lng — only fill if Zillow's was missing (rare for buildings)
+    if zillow.lat is None and apt.get("latitude") is not None:
+        zillow.lat = apt["latitude"]
+    if zillow.lng is None and apt.get("longitude") is not None:
+        zillow.lng = apt["longitude"]
+    # Description fallback
+    if not zillow.description and apt.get("description"):
+        zillow.description = apt["description"]
+    # Neighborhood fallback (apartments.com breadcrumb is often more
+    # specific than Zillow's neighborhood field)
+    if not zillow.neighborhood and apt.get("neighborhood"):
+        zillow.neighborhood = apt["neighborhood"]
+
 
 def merge_into_zillow(
     listings: list[Listing], apt_records: list[dict],
@@ -224,15 +250,17 @@ def _apt_to_listing(apt: dict) -> Listing | None:
         zpid=apt.get("zpid", ""),  # already prefixed "apt:"
         name=apt.get("building_name") or apt.get("street_address") or "(unnamed)",
         address=apt.get("full_address") or "",
-        neighborhood=None,  # Tier 2
-        lat=None,           # Tier 2: geocode or detail-fetch
-        lng=None,
+        neighborhood=apt.get("neighborhood"),
+        lat=apt.get("latitude"),
+        lng=apt.get("longitude"),
         rent_min=min(all_mins) if all_mins else None,
         rent_max=max(all_maxs) if all_maxs else None,
         rent_by_bed=rent_by_bed,
-        walk_score=None,
-        transit_score=None,
-        bike_score=None,
+        walk_score=apt.get("walk_score"),
+        transit_score=apt.get("transit_score"),
+        bike_score=apt.get("bike_score"),
+        sound_score=apt.get("sound_score"),
+        sound_label=apt.get("sound_label"),
         pets_allowed=apt.get("pets_allowed") or [],
         has_pool=bool(apt.get("has_pool")),
         has_elevator=apt.get("has_elevator"),
@@ -242,7 +270,7 @@ def _apt_to_listing(apt: dict) -> Listing | None:
         utilities_included=[],
         deposit_min=None,
         deposit_max=None,
-        description="",
+        description=(apt.get("description") or "")[:500],
         url=apt.get("url", ""),
         raw=raw,
     )
