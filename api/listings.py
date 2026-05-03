@@ -466,6 +466,46 @@ def load_listings(
         len(out), normalized_count, skipped,
     )
 
+    # --- optionally overlay Zillow primary photo URLs ---------------------
+    # Original enrich.py only saved photoCount, not URLs. tools/extract_zillow_photos.py
+    # recovers URLs from the cached raw_details/*.json blobs (no re-scraping)
+    # into a tiny api/data/zillow_photos.jsonl.gz overlay keyed by zpid.
+    # apartments.com listings already have primary_photo_url baked in via
+    # tools/build_apartments_dataset.py — they're untouched here.
+    photos_candidates = [
+        os.environ.get("ZILLOW_PHOTOS_PATH"),
+        DEFAULT_DATA_DIR / "zillow_photos.jsonl.gz",
+    ]
+    photos_path = None
+    for cand in photos_candidates:
+        if cand and Path(cand).exists():
+            photos_path = cand
+            break
+    if photos_path:
+        photo_lookup: dict[str, str] = {}
+        with gzip.open(photos_path, "rt", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                z = rec.get("zpid")
+                u = rec.get("primary_photo_url")
+                if z and u:
+                    photo_lookup[str(z)] = u
+        n_patched = 0
+        for L in out:
+            if L.raw.get("primary_photo_url"):
+                continue  # apartments.com already provided one
+            url = photo_lookup.get(L.zpid)
+            if url:
+                L.raw["primary_photo_url"] = url
+                n_patched += 1
+        log.info(
+            "load_listings: zillow photo overlay → %d listings patched (pool: %d)",
+            n_patched, len(photo_lookup),
+        )
+
     # --- optionally merge Craigslist (apartment.com upstream) -------------
     cl_candidates = [
         os.environ.get("CRAIGSLIST_PATH"),

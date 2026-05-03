@@ -1577,13 +1577,29 @@ function MessageRow({
   const pinsWithCoords: MapPin[] = isMapEligible
     ? shortlist
         .filter((s) => s.lat !== null && s.lng !== null)
-        .map((s, idx) => ({
-          zpid: s.zpid,
-          lat: s.lat!,
-          lng: s.lng!,
-          rank: idx + 1,
-          score: s.score ?? 0,
-        }))
+        .map((s, idx) => {
+          // Build a compact rent label like "1BR · $2,595" or
+          // "Studio · from $1,295" depending on what's known. Same logic
+          // ShortlistCard uses, condensed into one line for the popup.
+          let rentLabel: string | null = null;
+          const beds = Object.keys(s.rent_by_bed || {})[0];
+          if (s.rent_min !== null && s.rent_max !== null && s.rent_min !== s.rent_max) {
+            rentLabel = `${beds ? beds + " · " : ""}$${s.rent_min.toLocaleString()}–$${s.rent_max.toLocaleString()}`;
+          } else if (s.rent_min !== null) {
+            rentLabel = `${beds ? beds + " · " : ""}$${s.rent_min.toLocaleString()}`;
+          }
+          return {
+            zpid: s.zpid,
+            lat: s.lat!,
+            lng: s.lng!,
+            rank: idx + 1,
+            score: s.score ?? 0,
+            name: s.name,
+            photoUrl: s.photo_url,
+            rentLabel,
+            url: s.url,
+          };
+        })
     : [];
 
   // Show MapCard when ≥2 listings have coordinates and user hasn't toggled to list view

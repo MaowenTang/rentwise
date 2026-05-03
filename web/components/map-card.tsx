@@ -11,8 +11,14 @@ export type MapPin = {
   zpid: string;
   lat: number;
   lng: number;
-  rank: number;   // 1-based, shown as pin label
-  score: number;  // 0–100, drives pin color tier
+  rank: number;     // 1-based, shown as pin label
+  score: number;    // 0–100, drives pin color tier
+  // Optional fields used by the click-popup. All are best-effort —
+  // popup degrades gracefully when missing.
+  name?: string | null;
+  photoUrl?: string | null;
+  rentLabel?: string | null;  // e.g. "1BR · $2,595" (formatted by parent)
+  url?: string | null;        // Zillow / apartments.com detail link
 };
 
 type MapCardProps = {
@@ -27,6 +33,54 @@ function pinColors(score: number): { bg: string; border: string } {
   if (score >= 70) return { bg: "#10b981", border: "#059669" }; // emerald
   if (score >= 40) return { bg: "#f59e0b", border: "#d97706" }; // amber
   return { bg: "#9ca3af", border: "#6b7280" };                  // gray
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function buildPopupHtml(pin: MapPin): string {
+  // Mapbox popups use innerHTML — every interpolation must be escaped or
+  // a listing name with `<` would break the markup. URLs are filtered:
+  // accept only http(s) so we don't smuggle javascript: into href.
+  const safeName = pin.name ? escapeHtml(pin.name) : "Listing";
+  const safeRent = pin.rentLabel ? escapeHtml(pin.rentLabel) : "";
+  const safePhoto =
+    pin.photoUrl && /^https?:\/\//i.test(pin.photoUrl)
+      ? escapeHtml(pin.photoUrl)
+      : "";
+  const safeUrl =
+    pin.url && /^https?:\/\//i.test(pin.url) ? escapeHtml(pin.url) : "";
+
+  const photoBlock = safePhoto
+    ? `<div style="width:100%;height:140px;overflow:hidden;background:#f3f4f6;border-radius:6px 6px 0 0;">
+         <img src="${safePhoto}" alt="${safeName}"
+              style="width:100%;height:100%;object-fit:cover;display:block;" />
+       </div>`
+    : `<div style="width:100%;height:90px;background:#f3f4f6;border-radius:6px 6px 0 0;display:flex;align-items:center;justify-content:center;color:#9ca3af;font-size:11px;">No photo</div>`;
+
+  const linkBlock = safeUrl
+    ? `<a href="${safeUrl}" target="_blank" rel="noopener"
+          style="display:inline-block;margin-top:6px;color:#047857;font-size:11px;font-weight:500;text-decoration:none;">View listing →</a>`
+    : "";
+
+  return `
+    <div style="font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.35;">
+      ${photoBlock}
+      <div style="padding:8px 10px 10px 10px;">
+        <div style="display:flex;align-items:baseline;gap:6px;">
+          <span style="font-size:11px;color:#6b7280;font-weight:600;">#${pin.rank}</span>
+          <span style="font-size:13px;font-weight:600;color:#111827;line-height:1.25;">${safeName}</span>
+        </div>
+        ${safeRent ? `<div style="font-size:12px;color:#374151;margin-top:2px;">${safeRent}</div>` : ""}
+        ${linkBlock}
+      </div>
+    </div>`;
 }
 
 function applyPinStyle(
@@ -74,10 +128,17 @@ export default function MapCard({
   const containerRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const mapRef = useRef<any>(null);
+  // Single reusable popup — one popup can only be open at a time, so we
+  // mutate this on each pin click instead of creating a new one. Cleaned
+  // up on unmount.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const popupRef = useRef<any>(null);
   // zpid → { DOM element, rank, score } for reactive style updates
   const pinEls = useRef<Map<string, { el: HTMLElement; rank: number; score: number }>>(
     new Map()
   );
+  // pinsByZpid → for popup lookup (rank, name, photo, etc.)
+  const pinDataRef = useRef<Map<string, MapPin>>(new Map());
 
   // Stable refs for callbacks/data used inside the one-time init effect
   const pinsSnapshot = useRef(pins);
@@ -145,10 +206,25 @@ export default function MapCard({
         // internal layout on first style application.
         map.resize();
 
+        // Single shared popup — anchor: bottom keeps the popup tip
+        // pointing at the pin so it doesn't cover the pin itself.
+        popupRef.current = new mapboxgl.Popup({
+          offset: 24,
+          anchor: "bottom",
+          closeButton: true,
+          closeOnClick: false,
+          maxWidth: "280px",
+        });
+
         for (const pin of pinsSnapshot.current) {
+          pinDataRef.current.set(pin.zpid, pin);
+
           const el = document.createElement("div");
           applyPinStyle(el, pin.rank, pin.score, false);
-          el.addEventListener("click", () => onPinClickRef.current(pin.zpid));
+          el.addEventListener("click", (e) => {
+            e.stopPropagation();
+            onPinClickRef.current(pin.zpid);
+          });
 
           new mapboxgl.Marker({ element: el, anchor: "center" })
             .setLngLat([pin.lng, pin.lat])
@@ -172,19 +248,35 @@ export default function MapCard({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const ro = (mapRef.current as any)?.__rwResizeObserver as ResizeObserver | null | undefined;
       ro?.disconnect();
+      popupRef.current?.remove();
+      popupRef.current = null;
       mapRef.current?.remove();
       mapRef.current = null;
       pinEls.current.clear();
+      pinDataRef.current.clear();
     };
   // Intentionally run only once on mount — pins come from pinsSnapshot ref
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Reactively update pin active styles whenever activeZpid changes
+  // Reactively update pin active styles AND show/hide the popup whenever
+  // activeZpid changes. Centralizing here means clicks from the right rail
+  // also pop the photo card open on the map (not just clicks on the pin).
   useEffect(() => {
     pinEls.current.forEach(({ el, rank, score }, zpid) => {
       applyPinStyle(el, rank, score, zpid === activeZpid);
     });
+    if (!mapRef.current || !popupRef.current) return;
+    if (!activeZpid) {
+      popupRef.current.remove();
+      return;
+    }
+    const pin = pinDataRef.current.get(activeZpid);
+    if (!pin) return;
+    popupRef.current
+      .setLngLat([pin.lng, pin.lat])
+      .setHTML(buildPopupHtml(pin))
+      .addTo(mapRef.current);
   }, [activeZpid]);
 
   // Layout notes
