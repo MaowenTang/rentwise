@@ -1,5 +1,10 @@
 "use client";
 
+// Mapbox ships its CSS as a separate file. Without it, .mapboxgl-canvas
+// doesn't get its `position: absolute; left:0; top:0` rules and the
+// canvas stacks at its intrinsic size instead of filling the container —
+// resulting in a map that only paints in the top portion of its frame.
+import "mapbox-gl/dist/mapbox-gl.css";
 import { useEffect, useRef } from "react";
 
 export type MapPin = {
