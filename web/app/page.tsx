@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import MapCard from "../components/map-card";
+import type { MapPin } from "../components/map-card";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -76,6 +78,12 @@ type ShortlistItem = {
   score_components: Record<string, number>;
   score_explanation: string;
   added_via: string;
+  // Map view fields — populated by backend shortlist_payload()
+  lat: number | null;
+  lng: number | null;
+  photo_url: string | null;
+  type_label: string | null;
+  rationale: string | null;
 };
 
 const AGENTS: {
@@ -176,6 +184,23 @@ export default function Home() {
   const [leftOpen, setLeftOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
+
+  // Map view shared state
+  const [activeZpid, setActiveZpid] = useState<string | null>(null);
+  const mapPanToRef = useRef<((lat: number, lng: number) => void) | null>(null);
+  const [listViewMessages, setListViewMessages] = useState<Set<string>>(new Set());
+
+  function toggleMapView(msgId: string) {
+    setListViewMessages((prev) => {
+      const next = new Set(prev);
+      if (next.has(msgId)) {
+        next.delete(msgId);
+      } else {
+        next.add(msgId);
+      }
+      return next;
+    });
+  }
 
   useEffect(() => {
     // Warm-up + health check. Uses fetchWithRetry so a sleeping API still
@@ -521,7 +546,18 @@ export default function Home() {
           </div>
         </header>
 
-        <ChatScroll messages={messages} busy={busy} endRef={endRef} onChipTap={sendText} />
+        <ChatScroll
+          messages={messages}
+          busy={busy}
+          endRef={endRef}
+          onChipTap={sendText}
+          shortlist={shortlist}
+          activeZpid={activeZpid}
+          setActiveZpid={setActiveZpid}
+          mapPanToRef={mapPanToRef}
+          listViewMessages={listViewMessages}
+          onToggleMapView={toggleMapView}
+        />
 
         <ChatInput input={input} setInput={setInput} onSend={send} busy={busy} />
       </main>
@@ -534,6 +570,9 @@ export default function Home() {
         onRemove={removeFromShortlist}
         mobileOpen={rightOpen}
         onMobileClose={() => setRightOpen(false)}
+        activeZpid={activeZpid}
+        setActiveZpid={setActiveZpid}
+        mapPanToRef={mapPanToRef}
       />
     </div>
   );
@@ -544,11 +583,23 @@ function ChatScroll({
   busy,
   endRef,
   onChipTap,
+  shortlist,
+  activeZpid,
+  setActiveZpid,
+  mapPanToRef,
+  listViewMessages,
+  onToggleMapView,
 }: {
   messages: Message[];
   busy: boolean;
   endRef: React.RefObject<HTMLDivElement | null>;
   onChipTap: (text: string) => void;
+  shortlist: ShortlistItem[];
+  activeZpid: string | null;
+  setActiveZpid: (zpid: string | null) => void;
+  mapPanToRef: React.RefObject<((lat: number, lng: number) => void) | null>;
+  listViewMessages: Set<string>;
+  onToggleMapView: (msgId: string) => void;
 }) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const [stickToBottom, setStickToBottom] = useState(true);
@@ -577,7 +628,18 @@ function ChatScroll({
       className="flex-1 min-h-0 overflow-y-auto px-6 py-6 space-y-5"
     >
       {messages.map((m) => (
-        <MessageRow key={m.id} m={m} onChipTap={onChipTap} busy={busy} />
+        <MessageRow
+          key={m.id}
+          m={m}
+          onChipTap={onChipTap}
+          busy={busy}
+          shortlist={shortlist}
+          activeZpid={activeZpid}
+          setActiveZpid={setActiveZpid}
+          mapPanToRef={mapPanToRef}
+          listViewMessages={listViewMessages}
+          onToggleMapView={onToggleMapView}
+        />
       ))}
       {busy && (
         <div className="text-sm text-stone-500 italic flex items-center gap-2">
@@ -1239,6 +1301,9 @@ function ShortlistRail({
   onRemove,
   mobileOpen,
   onMobileClose,
+  activeZpid,
+  setActiveZpid,
+  mapPanToRef,
 }: {
   items: ShortlistItem[];
   profileSummary: string;
@@ -1246,7 +1311,19 @@ function ShortlistRail({
   onRemove: (zpid: string) => void;
   mobileOpen: boolean;
   onMobileClose: () => void;
+  activeZpid: string | null;
+  setActiveZpid: (zpid: string | null) => void;
+  mapPanToRef: React.RefObject<((lat: number, lng: number) => void) | null>;
 }) {
+  const railRef = useRef<HTMLDivElement>(null);
+
+  // Scroll active card into view when a map pin is clicked
+  useEffect(() => {
+    if (!activeZpid || !railRef.current) return;
+    const card = railRef.current.querySelector(`[data-zpid="${activeZpid}"]`);
+    card?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [activeZpid]);
+
   return (
     <aside
       className={`
@@ -1284,7 +1361,7 @@ function ShortlistRail({
         </div>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-2">
+      <div ref={railRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-2">
         {items.length === 0 ? (
           <div className="text-sm text-stone-500 leading-relaxed px-2 pt-4">
             <p>Tell the Search Agent what you&apos;re looking for and matches will appear here, ranked live by your preferences.</p>
@@ -1301,6 +1378,13 @@ function ShortlistRail({
               userBedsMin={profile.beds_min ?? null}
               userBedsMax={profile.beds_max ?? null}
               onRemove={() => onRemove(it.zpid)}
+              isActive={activeZpid === it.zpid}
+              onActivate={() => {
+                if (it.lat !== null && it.lng !== null) {
+                  mapPanToRef.current?.(it.lat, it.lng);
+                }
+                setActiveZpid(activeZpid === it.zpid ? null : it.zpid);
+              }}
             />
           ))
         )}
@@ -1315,14 +1399,19 @@ function ShortlistCard({
   userBedsMin,
   userBedsMax,
   onRemove,
+  isActive = false,
+  onActivate,
 }: {
   item: ShortlistItem;
   rank: number;
   userBedsMin: number | null;
   userBedsMax: number | null;
   onRemove: () => void;
+  isActive?: boolean;
+  onActivate?: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const hasCoords = item.lat !== null && item.lng !== null;
   const score = item.score ?? 0;
   const scoreColor =
     score >= 85
@@ -1363,7 +1452,15 @@ function ShortlistCard({
     .sort((a, b) => b[1] - a[1]);
 
   return (
-    <div className="border border-stone-200 rounded-lg bg-white overflow-hidden hover:border-stone-300 hover:shadow-md transition shadow-[0_1px_2px_rgba(28,25,23,0.04)]">
+    <div
+      data-zpid={item.zpid}
+      onClick={onActivate}
+      className={`border rounded-lg bg-white overflow-hidden transition shadow-[0_1px_2px_rgba(28,25,23,0.04)] ${
+        isActive
+          ? "border-emerald-400 ring-2 ring-emerald-300 shadow-md"
+          : "border-stone-200 hover:border-stone-300 hover:shadow-md"
+      } ${hasCoords && onActivate ? "cursor-pointer" : ""}`}
+    >
       <div className="px-3 py-2 flex items-start gap-3">
         <div className="flex flex-col items-center pt-0.5">
           <div className="text-[10px] text-stone-400 font-mono">#{rank}</div>
@@ -1401,7 +1498,7 @@ function ShortlistCard({
           </div>
         </div>
         <button
-          onClick={onRemove}
+          onClick={(e) => { e.stopPropagation(); onRemove(); }}
           className="text-stone-400 hover:text-red-700 text-sm leading-none px-1"
           title="Remove from shortlist"
         >
@@ -1412,7 +1509,7 @@ function ShortlistCard({
       {components.length > 0 && (
         <div className="border-t border-stone-200/80">
           <button
-            onClick={() => setExpanded((x) => !x)}
+            onClick={(e) => { e.stopPropagation(); setExpanded((x) => !x); }}
             className="w-full text-left px-3 py-1.5 text-[10px] uppercase tracking-wider text-stone-500 hover:text-stone-600 flex items-center justify-between"
           >
             <span>why?</span>
@@ -1454,11 +1551,46 @@ function MessageRow({
   m,
   onChipTap,
   busy,
+  shortlist,
+  activeZpid,
+  setActiveZpid,
+  mapPanToRef,
+  listViewMessages,
+  onToggleMapView,
 }: {
   m: Message;
   onChipTap: (text: string) => void;
   busy: boolean;
+  shortlist: ShortlistItem[];
+  activeZpid: string | null;
+  setActiveZpid: (zpid: string | null) => void;
+  mapPanToRef: React.RefObject<((lat: number, lng: number) => void) | null>;
+  listViewMessages: Set<string>;
+  onToggleMapView: (msgId: string) => void;
 }) {
+  // Determine if this message is eligible to show a MapCard
+  const isMapEligible =
+    m.sender === "agent" &&
+    m.agent === "search" &&
+    (m.meta as { phase?: string } | undefined)?.phase === "results";
+
+  const pinsWithCoords: MapPin[] = isMapEligible
+    ? shortlist
+        .filter((s) => s.lat !== null && s.lng !== null)
+        .map((s, idx) => ({
+          zpid: s.zpid,
+          lat: s.lat!,
+          lng: s.lng!,
+          rank: idx + 1,
+          score: s.score ?? 0,
+        }))
+    : [];
+
+  // Show MapCard when ≥2 listings have coordinates and user hasn't toggled to list view
+  const showMap = isMapEligible && pinsWithCoords.length >= 2 && !listViewMessages.has(m.id);
+  const showToggle = isMapEligible && pinsWithCoords.length >= 2;
+  const isListView = listViewMessages.has(m.id);
+
   if (m.sender === "system") {
     return (
       <div className="text-sm text-stone-600 border-l-2 border-stone-300 pl-3 py-1 prose prose-stone prose-sm max-w-none">
@@ -1506,6 +1638,30 @@ function MessageRow({
               minute: "2-digit",
             })}
           </span>
+          {showToggle && (
+            <div className="ml-auto flex rounded border border-stone-200 overflow-hidden text-[11px]">
+              <button
+                onClick={() => isListView && onToggleMapView(m.id)}
+                className={`px-2 py-0.5 transition ${
+                  !isListView
+                    ? "bg-stone-900 text-white"
+                    : "bg-white text-stone-500 hover:bg-stone-50"
+                }`}
+              >
+                Map
+              </button>
+              <button
+                onClick={() => !isListView && onToggleMapView(m.id)}
+                className={`px-2 py-0.5 transition ${
+                  isListView
+                    ? "bg-stone-900 text-white"
+                    : "bg-white text-stone-500 hover:bg-stone-50"
+                }`}
+              >
+                List
+              </button>
+            </div>
+          )}
         </div>
         {isUser ? (
           <div className="text-sm text-stone-800 whitespace-pre-wrap leading-relaxed">
@@ -1515,6 +1671,21 @@ function MessageRow({
           <div className="text-sm text-stone-800 prose prose-stone prose-sm max-w-none prose-a:text-emerald-700 prose-strong:text-stone-900">
             <Markdown text={m.text} />
           </div>
+        )}
+        {showMap && (
+          <MapCard
+            pins={pinsWithCoords}
+            activeZpid={activeZpid}
+            onPinClick={(zpid) => {
+              setActiveZpid(activeZpid === zpid ? null : zpid);
+            }}
+            onMapReady={(panTo) => {
+              mapPanToRef.current = panTo;
+            }}
+            onMapDestroy={() => {
+              mapPanToRef.current = null;
+            }}
+          />
         )}
       </div>
     </div>
