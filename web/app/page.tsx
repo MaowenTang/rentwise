@@ -1315,9 +1315,11 @@ function ShortlistCard({
 
   const beds = Object.keys(item.rent_by_bed).join(", ") || "?";
   const rent =
-    item.rent_min && item.rent_max
+    item.rent_min && item.rent_max && item.rent_min !== item.rent_max
       ? `$${item.rent_min.toLocaleString()}–$${item.rent_max.toLocaleString()}`
-      : "rent ?";
+      : item.rent_min
+        ? `from $${item.rent_min.toLocaleString()}`
+        : "rent ?";
 
   const components = Object.entries(item.score_components || {})
     .sort((a, b) => b[1] - a[1]);

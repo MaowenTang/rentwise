@@ -95,11 +95,14 @@ class Listing:
         beds = ",".join(
             f"{b}BR" if b > 0 else "Studio" for b in sorted(self.rent_by_bed)
         ) or "?"
-        rent = (
-            f"${self.rent_min:,}-${self.rent_max:,}"
-            if self.rent_min and self.rent_max
-            else "rent ?"
-        )
+        if self.rent_min and self.rent_max and self.rent_min != self.rent_max:
+            rent = f"${self.rent_min:,}-${self.rent_max:,}"
+        elif self.rent_min and self.rent_max:
+            rent = f"${self.rent_min:,}"
+        elif self.rent_min:
+            rent = f"from ${self.rent_min:,}"
+        else:
+            rent = "rent ?"
         loc = f"{self.neighborhood}, " if self.neighborhood else ""
         return f"{self.name} ({beds}) {rent} — {loc}walk {self.walk_score}"
 

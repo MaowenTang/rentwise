@@ -177,11 +177,14 @@ class SearchAgent(BaseAgent):
             beds = ", ".join(
                 ("Studio" if b == 0 else f"{b}BR") for b in sorted(L.rent_by_bed)
             ) or "?"
-            rent = (
-                f"${L.rent_min:,}–${L.rent_max:,}"
-                if L.rent_min and L.rent_max
-                else "rent ?"
-            )
+            if L.rent_min and L.rent_max and L.rent_min != L.rent_max:
+                rent = f"${L.rent_min:,}–${L.rent_max:,}"
+            elif L.rent_min and L.rent_max:
+                rent = f"${L.rent_min:,}"
+            elif L.rent_min:
+                rent = f"from ${L.rent_min:,}"
+            else:
+                rent = "rent ?"
             loc = L.neighborhood or "—"
             url = L.url or ""
             rationale = L.raw.get("_rationale", "").strip()
