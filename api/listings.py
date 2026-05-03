@@ -507,6 +507,84 @@ def load_listings(
     return out
 
 
+# Known Bay Area cities + common aliases / typos. Keys are lowercase
+# patterns; values are canonical city names that match the `city` field
+# in our listing data (Zillow + apartments.com both store "San Francisco",
+# "San Jose", etc. with that capitalization).
+BAY_AREA_CITY_ALIASES: dict[str, str] = {
+    "san francisco": "San Francisco",
+    "san fransisco": "San Francisco",   # common typo
+    "san franciso": "San Francisco",
+    "san fran": "San Francisco",
+    "sf": "San Francisco",
+    "san jose": "San Jose",
+    "sj": "San Jose",
+    "oakland": "Oakland",
+    "berkeley": "Berkeley",
+    "fremont": "Fremont",
+    "hayward": "Hayward",
+    "sunnyvale": "Sunnyvale",
+    "mountain view": "Mountain View",
+    "palo alto": "Palo Alto",
+    "santa clara": "Santa Clara",
+    "cupertino": "Cupertino",
+    "milpitas": "Milpitas",
+    "campbell": "Campbell",
+    "los gatos": "Los Gatos",
+    "saratoga": "Saratoga",
+    "alameda": "Alameda",
+    "san leandro": "San Leandro",
+    "union city": "Union City",
+    "pleasanton": "Pleasanton",
+    "dublin": "Dublin",
+    "livermore": "Livermore",
+    "walnut creek": "Walnut Creek",
+    "concord": "Concord",
+    "richmond": "Richmond",
+    "el cerrito": "El Cerrito",
+    "san mateo": "San Mateo",
+    "redwood city": "Redwood City",
+    "menlo park": "Menlo Park",
+    "daly city": "Daly City",
+    "south san francisco": "South San Francisco",
+    "south sf": "South San Francisco",
+    "san bruno": "San Bruno",
+    "burlingame": "Burlingame",
+}
+
+
+def parse_location_phrase(phrase: str) -> tuple[str | None, str | None]:
+    """Split a free-text location like "san fransisco downtown" into
+    (canonical_city, sub_area) using BAY_AREA_CITY_ALIASES.
+
+    Examples:
+      "san francisco downtown"  → ("San Francisco", "downtown")
+      "downtown sf"             → ("San Francisco", "downtown")
+      "willow glen"             → (None, "willow glen")  # not a known city
+      "sf"                      → ("San Francisco", None)
+    """
+    s = phrase.lower().strip()
+    if not s:
+        return (None, None)
+    # Match longest alias first (so "san francisco" wins over "san")
+    for alias in sorted(BAY_AREA_CITY_ALIASES, key=len, reverse=True):
+        canonical = BAY_AREA_CITY_ALIASES[alias]
+        if s == alias:
+            return (canonical, None)
+        # alias as prefix: "san francisco downtown"
+        if s.startswith(alias + " "):
+            return (canonical, s[len(alias) + 1:].strip() or None)
+        # alias as suffix: "downtown san francisco"
+        if s.endswith(" " + alias):
+            return (canonical, s[: -(len(alias) + 1)].strip() or None)
+        # alias somewhere in the middle: "near san francisco downtown" — rare
+        if f" {alias} " in s:
+            i = s.index(f" {alias} ")
+            sub = (s[:i] + " " + s[i + len(alias) + 2:]).strip()
+            return (canonical, sub or None)
+    return (None, s)
+
+
 def filter_listings(
     listings: Iterable[Listing],
     *,
@@ -517,6 +595,11 @@ def filter_listings(
     neighborhood: str | None = None,
 ) -> list[Listing]:
     out: list[Listing] = []
+    target_city: str | None = None
+    sub_area: str | None = None
+    if neighborhood:
+        target_city, sub_area = parse_location_phrase(neighborhood)
+
     for L in listings:
         if max_rent is not None:
             # If user specified a budget, REJECT listings without known rent.
@@ -535,7 +618,20 @@ def filter_listings(
             allowed = {p.lower() for p in (L.pets_allowed or [])}
             if not any(pets.lower() in a for a in allowed):
                 continue
-        if neighborhood and L.neighborhood:
+        # City filter (hard) — derived from the neighborhood phrase.
+        # Without this, "san francisco downtown" used to fall through and
+        # show San Jose listings ranked higher on cheap rent. Once city
+        # is locked, sub_area is left as a ranking signal (handled in
+        # RankingService) — being strict on sub-area excludes nearby
+        # neighborhoods like SoMa/Tenderloin from a "SF downtown" search.
+        if target_city is not None:
+            listing_city = (L.raw or {}).get("city") or ""
+            if listing_city.lower() != target_city.lower():
+                continue
+        elif neighborhood and L.neighborhood:
+            # Phrase didn't parse to a known city → fall back to
+            # legacy substring match against Listing.neighborhood
+            # (e.g. user typed "Willow Glen", "Mission District").
             if neighborhood.lower() not in L.neighborhood.lower():
                 continue
         out.append(L)
