@@ -187,14 +187,26 @@ export default function MapCard({
     });
   }, [activeZpid]);
 
+  // Layout notes
+  // ------------
+  // Container sizing must be deterministic — Mapbox sizes its canvas from
+  // getBoundingClientRect() at init time, so any "lazy" parent constraint
+  // (minHeight, flex stretch, flex-basis: auto) that resolves AFTER mount
+  // leaves the canvas pinned to the wrong size. We use a fixed pixel
+  // height (no minHeight, no flex behavior) and ensure the inner div is
+  // the direct sized parent for `new mapboxgl.Map({ container })`.
+  //
+  // `block` (not flex) on the outer + a single child that fills it
+  // avoids stretch surprises from any ancestor flex column.
   return (
     <div
-      className="relative mt-2 w-full rounded-lg overflow-hidden border border-stone-200 shadow-sm bg-stone-100"
-      style={{ minHeight: 380 }}
+      className="block mt-2 w-full rounded-lg overflow-hidden border border-stone-200 shadow-sm bg-stone-100"
+      style={{ height: 380 }}
     >
-      {/* Skeleton — sits behind map tiles, fades behind them once loaded */}
-      <div className="absolute inset-0 bg-stone-100 animate-pulse" />
-      <div ref={containerRef} className="absolute inset-0" />
+      <div
+        ref={containerRef}
+        style={{ width: "100%", height: "100%" }}
+      />
     </div>
   );
 }
