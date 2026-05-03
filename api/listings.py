@@ -484,6 +484,26 @@ def load_listings(
                 len(out), n_merged, n_added,
             )
 
+    # --- optionally merge apartments.com (Bay Area card crawl) ---------
+    apt_candidates = [
+        os.environ.get("APARTMENTS_COM_PATH"),
+        DEFAULT_DATA_DIR / "apartments_com_listings.jsonl.gz",
+    ]
+    apt_path = None
+    for cand in apt_candidates:
+        if cand and Path(cand).exists():
+            apt_path = cand
+            break
+    if apt_path:
+        from apartments_com import load_apartments_com, merge_into_zillow as _apt_merge
+        apt_records = load_apartments_com(apt_path)
+        if apt_records:
+            out, n_merged, n_added = _apt_merge(out, apt_records)
+            log.info(
+                "load_listings: apartments.com merge → %d records (%d merged into Zillow, %d new)",
+                len(out), n_merged, n_added,
+            )
+
     return out
 
 
