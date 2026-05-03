@@ -111,8 +111,34 @@ export default function MapCard({
 
       mapRef.current = map;
 
+      // Mapbox sizes its canvas at construction time using the container's
+      // bounding rect. When the component mounts inside a flex/grid parent
+      // or with a delayed minHeight, the rect can be 0×N or N×0 on first
+      // paint — leaving the canvas frozen at that tiny size even after
+      // the container grows. Two safety nets:
+      //   1. Force a resize once on first paint (covers most cases).
+      //   2. ResizeObserver on the container — anytime layout shifts the
+      //      box, Mapbox re-projects to fill it. Cheap and idempotent.
+      requestAnimationFrame(() => {
+        if (!cancelled) mapRef.current?.resize();
+      });
+      let resizeObserver: ResizeObserver | null = null;
+      if (containerRef.current && typeof ResizeObserver !== "undefined") {
+        resizeObserver = new ResizeObserver(() => {
+          mapRef.current?.resize();
+        });
+        resizeObserver.observe(containerRef.current);
+      }
+      // Stash on the map so the cleanup closure can disconnect it
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (map as any).__rwResizeObserver = resizeObserver;
+
       map.on("load", () => {
         if (cancelled) return;
+
+        // Re-resize after style load too — Mapbox sometimes recomputes
+        // internal layout on first style application.
+        map.resize();
 
         for (const pin of pinsSnapshot.current) {
           const el = document.createElement("div");
@@ -138,6 +164,9 @@ export default function MapCard({
     return () => {
       cancelled = true;
       onMapDestroyRef.current();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ro = (mapRef.current as any)?.__rwResizeObserver as ResizeObserver | null | undefined;
+      ro?.disconnect();
       mapRef.current?.remove();
       mapRef.current = null;
       pinEls.current.clear();
