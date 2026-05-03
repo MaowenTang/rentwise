@@ -77,6 +77,12 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     session_id: str
     message: str
+    # Client-side state mirror — used to re-hydrate session when backend
+    # instance restarts (Render free tier spins down after 15min idle).
+    # Frontend sends its current profile + the zpids it has on screen
+    # every turn; backend uses them only if its session is empty.
+    client_profile: dict | None = None
+    client_scope_zpids: list[str] | None = None
 
 
 class ChatResponse(BaseModel):
@@ -166,6 +172,78 @@ def _profile_dict(session) -> dict:  # noqa: ANN001
     return d
 
 
+def _profile_from_dict(d: dict):
+    """Re-hydrate a UserProfile dataclass from a JSON dict (frontend mirror).
+
+    Tolerant of missing fields; falls back to defaults. Used when the
+    backend instance restarted but the frontend still has the user's
+    profile in React state.
+    """
+    from profile import CommuteTarget, UserProfile
+    p = UserProfile()
+    for k in ("user_name", "move_in_date", "notes"):
+        v = d.get(k)
+        if isinstance(v, str):
+            setattr(p, k, v)
+    for k in ("budget_max", "beds_min", "beds_max"):
+        v = d.get(k)
+        if isinstance(v, int):
+            setattr(p, k, v)
+    for k in ("pets", "must_haves", "nice_to_haves", "avoid", "neighborhoods"):
+        v = d.get(k)
+        if isinstance(v, list):
+            setattr(p, k, [x for x in v if isinstance(x, str)])
+    c = d.get("commute")
+    if isinstance(c, dict) and c.get("name"):
+        p.commute = CommuteTarget(
+            name=c.get("name") or "",
+            address=c.get("address") or "",
+            lat=c.get("lat"),
+            lng=c.get("lng"),
+            max_minutes=c.get("max_minutes"),
+        )
+    w = d.get("weights")
+    if isinstance(w, dict):
+        p.weights = {k: float(v) for k, v in w.items() if isinstance(v, (int, float))}
+    return p
+
+
+def _hydrate_session_from_client(session, req: "ChatRequest") -> bool:
+    """If the session is empty (likely a post-restart fresh session),
+    populate it from the client-supplied state. Returns True if anything
+    was hydrated.
+    """
+    hydrated = False
+    p = session.profile
+    profile_empty = (
+        p.budget_max is None
+        and not p.pets
+        and not p.must_haves
+        and not p.nice_to_haves
+        and not p.avoid
+        and not p.commute
+        and not p.user_name
+    )
+    if profile_empty and req.client_profile:
+        session.profile = _profile_from_dict(req.client_profile)
+        hydrated = True
+
+    if not session.listings_in_scope and req.client_scope_zpids:
+        by_zpid = STATE["agents"]["search"].by_zpid
+        session.listings_in_scope = [
+            by_zpid[z] for z in req.client_scope_zpids if z in by_zpid
+        ]
+        # Also seed the shortlist so the right rail stays consistent.
+        for L in session.listings_in_scope:
+            session.add_to_shortlist(L, via="rehydrate")
+        if session.listings_in_scope:
+            hydrated = True
+
+    if hydrated:
+        session.rescore_shortlist(STATE["ranker"])
+    return hydrated
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -176,6 +254,17 @@ def chat(req: ChatRequest):
 
     sessions: SessionStore = STATE["sessions"]
     session = sessions.get(req.session_id)
+
+    # Re-hydrate from frontend mirror if the session is empty (e.g. backend
+    # restarted between turns and lost in-memory state).
+    if _hydrate_session_from_client(session, req):
+        LOG.info(
+            "[%s] re-hydrated session from client mirror (profile=%s, scope=%d)",
+            req.session_id[:8],
+            session.profile.to_summary(),
+            len(session.listings_in_scope),
+        )
+
     session.history.append(ChatTurn(role="user", agent=None, text=req.message))
 
     # 1. Update profile from this turn (parallel-safe with router because

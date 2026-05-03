@@ -31,13 +31,21 @@ Available agents:
     Do NOT use search if the user is asking about listings that are
     already in scope.
 
-  "property" — Detailed FACTS about listings already in scope.
-      • "does The James include water?"  (utilities)
-      • "what's the deposit on the second one?"
-      • "compare 1br pricing across these three"
-      • "is parking included?"
-      • "what amenities does Miro have?"
-      • "is it pet-friendly?"
+  "property" — Detailed FACTS about listings already in scope. This is
+    ALWAYS the right choice for questions about a specific listing's:
+      • rent / deposit / fees / lease term / utilities included
+      • parking (cost, availability, type, garage vs street)
+      • pet policy, pet fees, pet weight limits
+      • amenities the listing itself advertises (gym, pool, laundry)
+      • application fee, admin fee, move-in costs
+      • lease length / minimum stay / break-lease fee
+    English: "does X include water?" / "what's the deposit?" / "is parking
+      included?" / "compare 1br pricing" / "what's the application fee?"
+    中文 (CRITICAL — always property, never search/location):
+      • "押金多少" / "有停车费吗" / "停车费多少" / "宠物费"
+      • "水电费包含吗" / "包水电吗" / "包不包" / "需不需要"
+      • "签多久合同" / "最少租多久" / "申请费"
+      • "1bd多少钱" / "studio多钱" / "对比一下租金"
 
   "location" — Anything GEOGRAPHIC, COMMUTE, or SURROUNDINGS:
       • walk / transit / bike scores

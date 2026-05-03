@@ -206,7 +206,15 @@ export default function Home() {
       const r = await fetchWithRetry(`${API}/chat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, message: text }),
+        body: JSON.stringify({
+          session_id: sessionId,
+          message: text,
+          // Send the frontend's mirror of profile + scope so the backend
+          // can re-hydrate if its in-memory session was lost (Render free
+          // tier spin-down between turns).
+          client_profile: profile,
+          client_scope_zpids: shortlist.map((s) => s.zpid),
+        }),
       });
       if (!r.ok) {
         const err = await r.text();
