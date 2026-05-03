@@ -14,6 +14,11 @@ from typing import Any
 from listings import Listing
 from profile import RankingService, ScoreBreakdown, UserProfile
 
+_KIND_LABELS: dict[str, str] = {
+    "apartment_building": "Apartment Building",
+    "single_home_raw": "Single Family Home",
+}
+
 
 @dataclass
 class ChatTurn:
@@ -73,6 +78,8 @@ class Session:
                     "name": L.name,
                     "address": L.address,
                     "neighborhood": L.neighborhood,
+                    "lat": L.lat,
+                    "lng": L.lng,
                     "rent_min": L.rent_min,
                     "rent_max": L.rent_max,
                     "rent_by_bed": {
@@ -82,6 +89,11 @@ class Session:
                     "walk_score": L.walk_score,
                     "transit_score": L.transit_score,
                     "url": L.url,
+                    "photo_url": L.raw.get("primary_photo_url"),
+                    "type_label": _KIND_LABELS.get(
+                        L.raw.get("kind", ""), None
+                    ),
+                    "rationale": L.raw.get("_rationale", "") or None,
                     "score": e.score.overall if e.score else None,
                     "score_components": e.score.components if e.score else {},
                     "score_explanation": e.score.explanation if e.score else "",
