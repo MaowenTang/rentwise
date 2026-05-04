@@ -494,6 +494,32 @@ def _yelp_reviews(
             "Yelp: %s → %d review(s) (verified=%s, verified_by=%s)",
             listing.name, len(results), verified, verified_by,
         )
+    else:
+        # Reviews endpoint returned nothing (blocked on free tier or business has 0 reviews).
+        # Fall back to storing aggregate rating from the search result — the agent can still
+        # surface "Yelp: 4.5★ (23 reviews)" even without individual review text.
+        agg_rating = business.get("rating")
+        agg_count = business.get("review_count", 0)
+        if agg_rating is not None and agg_count > 0:
+            results.append({
+                "zpid": listing.zpid,
+                "source": "yelp",
+                "external_id": f"agg_{biz_id}",
+                "text": None,   # no individual review text available
+                "rating": float(agg_rating),
+                "review_date": None,
+                "url": business.get("url", ""),
+                "verified": verified,
+                "verified_by": verified_by,
+                "scraped_at": now_iso,
+                # Extra aggregate fields for the agent to use directly
+                "review_count": agg_count,
+                "aggregate_only": True,
+            })
+            LOG.info(
+                "Yelp: %s → aggregate only (%.1f★, %d reviews, verified=%s)",
+                listing.name, agg_rating, agg_count, verified,
+            )
     return results
 
 
