@@ -9,7 +9,7 @@ Data sources:
     OAuth app (script type).  Free, 1 req/sec limit.
   • Yelp Fusion API — searches by building name + address, then verifies the
     matched business is within 500 m of the listing's lat/lng (Haversine).
-    Free tier: 500 calls/day.
+    Non-Places API (Business Search + Reviews): 300 calls/day, 5,000/month.
 
 Output schema (tools/data/reviews.jsonl):
   {
@@ -381,7 +381,7 @@ def _yelp_reviews(
     """Fetch Yelp reviews for a listing. Returns empty list if address mismatch."""
     if yelp_calls is None:
         yelp_calls = [0]
-    if yelp_calls[0] >= 490:  # keep buffer below 500/day limit
+    if yelp_calls[0] >= 280:  # keep buffer below 300/day non-Places API limit
         LOG.warning("Yelp daily limit approaching (%d calls), skipping %s", yelp_calls[0], listing.zpid)
         return []
 
