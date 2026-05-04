@@ -78,6 +78,37 @@ TOOLS_DIR = Path(__file__).resolve().parent
 DATA_DIR = TOOLS_DIR / "data"
 API_DATA_DIR = TOOLS_DIR.parent / "api" / "data"
 OUT_FILE = DATA_DIR / "reviews.jsonl"
+YELP_COUNTER_FILE = DATA_DIR / "yelp_call_count.json"
+
+# ---------------------------------------------------------------------------
+# Yelp API limits (two separate tiers)
+# ---------------------------------------------------------------------------
+# /v3/businesses/search  → Places API     → 5,000 calls/month, no daily cap
+# /v3/businesses/{id}/reviews → Non-Places API → 300 calls/day
+YELP_SEARCH_MONTHLY_LIMIT = 5_000   # Places API — tracked persistently
+YELP_REVIEWS_DAILY_LIMIT = 280      # Non-Places API — 300/day minus 20 buffer
+
+
+def _load_yelp_counter() -> dict:
+    """Load persistent Yelp call counter. Resets monthly search count if new month."""
+    if not YELP_COUNTER_FILE.exists():
+        return {"month": datetime.now(timezone.utc).strftime("%Y-%m"), "search_calls": 0}
+    try:
+        with open(YELP_COUNTER_FILE) as f:
+            data = json.load(f)
+        # Reset monthly counter if month changed
+        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        if data.get("month") != current_month:
+            data = {"month": current_month, "search_calls": 0}
+        return data
+    except (json.JSONDecodeError, KeyError):
+        return {"month": datetime.now(timezone.utc).strftime("%Y-%m"), "search_calls": 0}
+
+
+def _save_yelp_counter(counter: dict) -> None:
+    YELP_COUNTER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(YELP_COUNTER_FILE, "w") as f:
+        json.dump(counter, f)
 
 # ---------------------------------------------------------------------------
 # Subreddits to search for building-level reviews
@@ -376,24 +407,34 @@ def _yelp_reviews(
     client: YelpClient,
     listing: ListingStub,
     dry_run: bool = False,
-    yelp_calls: list[int] | None = None,  # mutable counter [calls_today]
+    reviews_calls_today: list[int] | None = None,  # mutable [Non-Places daily counter]
+    yelp_counter: dict | None = None,               # persistent monthly counter for Places
 ) -> list[dict]:
     """Fetch Yelp reviews for a listing. Returns empty list if address mismatch."""
-    if yelp_calls is None:
-        yelp_calls = [0]
-    if yelp_calls[0] >= 280:  # keep buffer below 300/day non-Places API limit
-        LOG.warning("Yelp daily limit approaching (%d calls), skipping %s", yelp_calls[0], listing.zpid)
+    if reviews_calls_today is None:
+        reviews_calls_today = [0]
+    if yelp_counter is None:
+        yelp_counter = {"month": "", "search_calls": 0}
+
+    # Check daily Non-Places limit (reviews endpoint)
+    if reviews_calls_today[0] >= YELP_REVIEWS_DAILY_LIMIT:
+        LOG.warning("Yelp reviews daily limit reached (%d/day), skipping %s", YELP_REVIEWS_DAILY_LIMIT, listing.zpid)
+        return []
+
+    # Check monthly Places limit (search endpoint)
+    if yelp_counter["search_calls"] >= YELP_SEARCH_MONTHLY_LIMIT:
+        LOG.warning("Yelp search monthly limit reached (%d/month), skipping %s", YELP_SEARCH_MONTHLY_LIMIT, listing.zpid)
         return []
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if dry_run:
         LOG.info("[DRY RUN] Would search Yelp for: %s, %s", listing.name, listing.address)
-        yelp_calls[0] += 1
         return []
 
     business = client.search(listing.name, listing.address, listing.city)
-    yelp_calls[0] += 1
+    yelp_counter["search_calls"] += 1
+    _save_yelp_counter(yelp_counter)
     time.sleep(0.5)
 
     if not business:
@@ -424,7 +465,7 @@ def _yelp_reviews(
 
     biz_id = business["id"]
     reviews = client.reviews(biz_id)
-    yelp_calls[0] += 1
+    reviews_calls_today[0] += 1
     time.sleep(0.5)
 
     results: list[dict] = []
@@ -524,7 +565,13 @@ def main() -> None:
     if not args.dry_run and not args.reddit_only:
         yelp = YelpClient(args.yelp_api_key)
 
-    yelp_calls = [0]  # mutable day-counter
+    reviews_calls_today = [0]      # mutable in-memory Non-Places daily counter
+    yelp_counter = _load_yelp_counter()   # persistent monthly Places counter
+    LOG.info(
+        "Yelp counters: search_calls=%d/%d (month=%s), reviews_calls_today=%d/%d",
+        yelp_counter["search_calls"], YELP_SEARCH_MONTHLY_LIMIT, yelp_counter["month"],
+        reviews_calls_today[0], YELP_REVIEWS_DAILY_LIMIT,
+    )
     total_reviews = 0
 
     LOG.info("Processing %d listings → %s", len(listings), out_path)
@@ -540,7 +587,11 @@ def main() -> None:
                 LOG.info("  Reddit: %d items", len(r_reviews))
 
         if not args.reddit_only:
-            y_reviews = _yelp_reviews(yelp, listing, dry_run=args.dry_run, yelp_calls=yelp_calls)
+            y_reviews = _yelp_reviews(
+                yelp, listing, dry_run=args.dry_run,
+                reviews_calls_today=reviews_calls_today,
+                yelp_counter=yelp_counter,
+            )
             reviews.extend(y_reviews)
             if y_reviews:
                 LOG.info("  Yelp: %d items", len(y_reviews))
