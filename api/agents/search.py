@@ -11,12 +11,55 @@ Flow:
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import asdict
 
 from listings import Listing, filter_listings
 from profile import RankingService, UserProfile
 
 from .base import AgentReply, BaseAgent
+
+# Reviews pre-warm — best-effort background fetch for top results.
+# Deferred import so SearchAgent still works if reviews_fetcher.py isn't ready.
+try:
+    from reviews_fetcher import get_reviews, get_reviews_or_fetch as _fetch_reviews
+    _REVIEWS_AVAILABLE = True
+except ImportError:
+    _REVIEWS_AVAILABLE = False
+
+
+def _prewarm_reviews(listings: list[Listing]) -> None:
+    """Spawn a daemon thread to pre-warm the reviews cache for top results.
+
+    Called non-blocking from SearchAgent.handle() after results are ranked.
+    For each listing not already in cache, triggers get_reviews_or_fetch()
+    in the background so Resident Reviews Agent hits cache on the user's
+    next question (Story 4).
+    """
+    if not _REVIEWS_AVAILABLE:
+        return
+
+    def _fetch_one(zpid: str, stub: dict) -> None:
+        try:
+            if not get_reviews(zpid):  # cache miss — fetch and populate
+                # get_reviews_or_fetch is async; asyncio.run() creates a fresh
+                # event loop in this daemon thread (safe — threads have no loop).
+                import asyncio
+                asyncio.run(_fetch_reviews(zpid, stub))
+        except Exception:
+            pass  # best-effort; never block or raise
+
+    for L in listings[:5]:
+        if not L.zpid:
+            continue
+        stub = {
+            "zpid": L.zpid,
+            "name": L.name,
+            "address": L.address,
+            "lat": L.lat,
+            "lng": L.lng,
+        }
+        threading.Thread(target=_fetch_one, args=(L.zpid, stub), daemon=True).start()
 
 
 CLARIFY_PROMPT = """You are RentWise's Search Agent. The user is starting an
@@ -279,6 +322,10 @@ class SearchAgent(BaseAgent):
             session.add_to_shortlist(L, via="search")
         session.listings_in_scope = ranked
         session.rescore_shortlist(self.ranker)
+
+        # Pre-warm Resident Reviews cache for top results (Story 4).
+        # Non-blocking: spawns daemon threads, never delays this response.
+        _prewarm_reviews(ranked)
 
         markdown = self._render(ranked, note, profile)
         return AgentReply(
