@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from agents.location import LocationCommuteAgent
 from agents.outreach import OutreachAgent
 from agents.property import PropertyAnalystAgent
+from agents.reviews import ResidentReviewsAgent
 from agents.router import AgentRouter
 from agents.search import SearchAgent
 from listings import load_listings
@@ -50,6 +51,7 @@ async def lifespan(app: FastAPI):
         "property": PropertyAnalystAgent(),
         "location": LocationCommuteAgent(),
         "outreach": OutreachAgent(),
+        "reviews": ResidentReviewsAgent(),
     }
     STATE["router"] = AgentRouter()
     yield

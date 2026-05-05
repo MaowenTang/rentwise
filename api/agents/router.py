@@ -9,6 +9,7 @@ Explicit @mentions override the router:
   @property ...  → PropertyAnalystAgent
   @location ...  → LocationCommuteAgent
   @outreach ...  → OutreachAgent
+  @reviews ...   → ResidentReviewsAgent
 """
 from __future__ import annotations
 
@@ -66,6 +67,22 @@ Available agents:
       • "draft a tour request"
       • "send a message to the top one"
 
+  "reviews" — Resident reviews, tenant sentiment, or building reputation.
+    Use ALWAYS when the user asks about what residents/tenants think:
+      • "what do residents say about [building]?"
+      • "is it noisy?" / "how's the noise level?"
+      • "how's management?" / "are they responsive?"
+      • "any maintenance issues?"
+      • "is it safe?" / "how's the neighborhood safety?"
+      • "what's the vibe like?" / "do people like living there?"
+      • "any reviews?" / "what's the rating?" / "stars?"
+      • "what do tenants think?" / "is it worth it?"
+    中文:
+      • "住户评价怎么样" / "居民评分" / "有没有差评"
+      • "噪音大吗" / "管理好不好" / "维修快吗" / "安不安全"
+    Do NOT use reviews for neighborhood walkability or commute — use location.
+    Do NOT use reviews for listing facts (deposit, parking) — use property.
+
 PENDING CLARIFICATION: {pending}
   → If non-null, the named agent asked a question last turn and is
     waiting for an answer. The user's message is most likely answering
@@ -80,11 +97,11 @@ CONTEXT:
 USER MESSAGE: "{message}"
 
 Respond with ONLY a JSON object:
-{{"agent": "search|property|location|outreach", "reason": "<one short sentence>"}}"""
+{{"agent": "search|property|location|outreach|reviews", "reason": "<one short sentence>"}}"""
 
 
-MENTION_RE = re.compile(r"@(search|property|location|outreach)\b", re.IGNORECASE)
-VALID = {"search", "property", "location", "outreach"}
+MENTION_RE = re.compile(r"@(search|property|location|outreach|reviews)\b", re.IGNORECASE)
+VALID = {"search", "property", "location", "outreach", "reviews"}
 
 
 class AgentRouter(BaseAgent):
