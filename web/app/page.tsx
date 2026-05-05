@@ -8,7 +8,7 @@ import type { MapPin } from "../components/map-card";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-type AgentId = "search" | "property" | "location" | "outreach";
+type AgentId = "search" | "property" | "location" | "outreach" | "reviews";
 type Sender = "user" | "agent" | "system";
 
 type Chip = { label: string; send: string };
@@ -97,6 +97,7 @@ const AGENTS: {
   { id: "property", label: "Property Analyst", color: "bg-sky-500", badge: "📋", hint: "Listing details" },
   { id: "location", label: "Location & Commute", color: "bg-violet-500", badge: "🗺️", hint: "Maps & schools" },
   { id: "outreach", label: "Outreach", color: "bg-amber-500", badge: "✉️", hint: "Email leasing offices" },
+  { id: "reviews", label: "Resident Reviews", color: "bg-rose-500", badge: "💬", hint: "Resident feedback & reviews" },
 ];
 
 const AGENT_BY_ID: Record<AgentId, (typeof AGENTS)[number]> = AGENTS.reduce(
