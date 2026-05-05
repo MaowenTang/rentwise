@@ -37,40 +37,52 @@ policy, total monthly cost.
 ALL_LISTINGS_IN_SCOPE below shows EVERY listing currently visible to the
 user, numbered 1..N in the order they appeared in chat.
 
+You have TOOLS available to consult other specialist agents — USE THEM
+when the user's question goes beyond pure property facts:
+
+  • Walk / transit / sound / bike score → call `location__get_walkability`
+  • Nearby groceries / restaurants / parks / schools → call `location__nearby_pois`
+  • Commute distance to a specific lat/lng → call `location__get_commute`
+  • Resident reviews / rating / complaints → call `reviews__summarize`
+  • Cheaper or alternative listings outside current scope → call `search__find_listings`
+
+When you call a tool, CITE its output in your final reply with the agent's
+name in @-mention form so the user sees the discussion:
+  ✓ "Per @location: Walk Score 99 (Walker's Paradise)."
+  ✓ "@reviews flags repeated elevator outages in 2024 (1.0 ★ recent review)."
+  ✗ Don't quietly fold tool data in without attribution.
+
 You can do TWO things:
 
-A) ANSWER — Use ONLY facts in ALL_LISTINGS_IN_SCOPE. If a field is null
-   or missing, say "not listed in the source" — do NOT invent data.
-   Cite specifically when you state a fact:
-     ✓ "The deposit at The James is $500 (deposit_min: 500)."
-     ✗ "The deposit is around $500."
+A) ANSWER — Use ONLY facts in ALL_LISTINGS_IN_SCOPE plus tool results.
+   If a field is null or missing AND no tool can fetch it, say "not
+   listed in the source" — do NOT invent data.
 
    Match your depth to the question:
 
    • SINGLE LISTING, SIMPLE FACT (e.g. "押金多少", "is parking included")
-     → 1–3 sentences. Cite the source field.
+     → 1–3 sentences. Cite the source field. No tools needed.
 
-   • MULTI-LISTING COMPARISON or CALCULATION (e.g. "compare deposits",
-     "total monthly cost including utilities", "which is cheapest after
-     fees", "rent + utilities 大概多少") → ALWAYS use a Markdown table
-     with these columns when relevant:
-        # | Listing | Base rent | Included utilities | Estimated extras |
-        Total/mo
+   • MULTI-LISTING COMPARISON / CALCULATION → Markdown table. Columns
+     depend on the question — use these when relevant:
+        # | Listing | Base rent | Included utilities | Estimated extras | Total/mo
      Then a 1–2 sentence takeaway naming the winner / outlier.
 
-   • CALCULATIONS — show the math. When utilities aren't fully listed,
-     state your assumption (e.g. "市场均价 electricity+gas+internet
-     $100–150/mo") clearly so the user can challenge it. Include a
-     ⚠️ disclaimer line at the top of the table flagging where data is
-     estimated vs. cited from source.
+   • CROSS-CUTTING ("which is quieter", "which has best reviews") →
+     CALL THE RIGHT TOOL for each listing in scope, then build a
+     comparison table that cites the tool author per cell:
+        # | Listing | Sound (@location) | Rating (@reviews) | …
+
+   • CALCULATIONS — show the math. State assumptions clearly with
+     ⚠️ disclaimer line.
 
    • AMBIGUOUS REFERENCE ("this place", "the second one") — resolve via
      LIKELY_TARGET_INDEXES; if still unclear, prefer the top-1.
 
 B) ASK — Only ask if the question can't be answered without external info
    (e.g. user's family size for "is it big enough?"). Then ONE focused
-   question, under 200 chars, ends with '?'. Don't ask when the data
-   itself is enough to answer.
+   question, under 200 chars, ends with '?'. Don't ask when data + tools
+   are enough.
 
 LIKELY_TARGET_INDEXES (1-based, my best guess — verify against the message):
 {likely_targets}
@@ -81,8 +93,7 @@ USER MESSAGE:
 ALL_LISTINGS_IN_SCOPE:
 {listings}
 
-Reply in clear Markdown. Use tables, totals, source citations, and a
-final takeaway when the user asked for comparison or calculation."""
+Reply in clear Markdown."""
 
 
 def resolve_listings(message: str, in_scope: list[Listing]) -> list[Listing]:
@@ -164,6 +175,12 @@ def listing_card_for_llm(L: Listing, idx: int) -> dict:
 class PropertyAnalystAgent(BaseAgent):
     name = "property"
 
+    def __init__(self, all_listings: list[Listing] | None = None, **kw):
+        super().__init__(**kw)
+        # Held for tool-use loop's `search__find_listings` to query against
+        # ALL listings, not just the current shortlist scope.
+        self.all_listings = all_listings or []
+
     def handle(self, message: str, session) -> AgentReply:  # noqa: ANN001
         if not session.listings_in_scope:
             return AgentReply(
@@ -174,33 +191,38 @@ class PropertyAnalystAgent(BaseAgent):
                 ),
             )
 
-        # Heuristic guess at which listings the user likely means.
         likely_targets = resolve_listings(message, session.listings_in_scope)
         likely_indexes = [
             session.listings_in_scope.index(L) + 1 for L in likely_targets
         ]
 
-        # Always send the FULL scope so the LLM can resolve correctly.
-        cards = [
-            listing_card_for_llm(L, i)
-            for i, L in enumerate(session.listings_in_scope[:5])
-        ]
+        # Always include FULL scope (with zpids) so tool-call args reference
+        # listings the model can actually see.
+        scope = session.listings_in_scope[:5]
+        cards = []
+        for i, L in enumerate(scope):
+            card = listing_card_for_llm(L, i)
+            card["zpid"] = L.zpid  # explicit — tools key on it
+            cards.append(card)
+
         prompt = ANALYZE_PROMPT.format(
             user_message=message,
             likely_targets=likely_indexes if likely_indexes else "(no clear ordinal — use your judgment)",
             listings=json.dumps(cards, indent=2, default=str),
         )
-        resp = self.client.messages.create(
-            model=self.model,
-            max_tokens=1200,
-            messages=[{"role": "user", "content": prompt}],
+
+        # Run the tool-use loop. Property's own get_facts tool is filtered
+        # out automatically (no self-recursion); it can call location +
+        # reviews + search tools.
+        text, tool_logs = self.tool_use_loop(
+            prompt,
+            scope=scope,
+            all_listings=self.all_listings,
+            max_tokens=1500,
         )
 
-        text = resp.content[0].text.strip()
         is_question = _looks_like_clarifying_question(text)
 
-        # Auto-add the listings the user is asking about to the shortlist
-        # (skip if the agent is asking instead of answering).
         if not is_question:
             for L in likely_targets:
                 session.add_to_shortlist(L, via="property")
@@ -211,7 +233,8 @@ class PropertyAnalystAgent(BaseAgent):
             awaiting=["clarify"] if is_question else None,
             metadata={
                 "resolved_zpids": [L.zpid for L in likely_targets],
-                "in_scope_zpids": [L.zpid for L in session.listings_in_scope[:5]],
+                "in_scope_zpids": [L.zpid for L in scope],
                 "phase": "clarifying" if is_question else "answer",
             },
+            tool_calls=tool_logs,
         )

@@ -12,6 +12,13 @@ type AgentId = "search" | "property" | "location" | "outreach" | "reviews";
 type Sender = "user" | "agent" | "system";
 
 type Chip = { label: string; send: string };
+type ToolCall = {
+  tool: string;          // e.g. "location__get_walkability"
+  args: Record<string, unknown>;
+  result_preview: string;
+  latency_ms: number;
+  error?: string | null;
+};
 type Message = {
   id: string;
   sender: Sender;
@@ -19,7 +26,8 @@ type Message = {
   text: string;
   routerReason?: string;
   meta?: Record<string, unknown>;
-  chips?: Chip[];        // tappable starter / quick-action chips
+  toolCalls?: ToolCall[]; // cross-agent tool calls made during this turn
+  chips?: Chip[];         // tappable starter / quick-action chips
   ts: number;
 };
 
@@ -254,6 +262,7 @@ export default function Home() {
         text: data.reply,
         routerReason: data.router_reason,
         meta: data.metadata,
+        toolCalls: (data.tool_calls as ToolCall[] | undefined) ?? undefined,
         ts: Date.now(),
       };
       const newMessages: Message[] = [agentMsg];
@@ -1704,7 +1713,68 @@ function MessageRow({
             }}
           />
         )}
+        {m.toolCalls && m.toolCalls.length > 0 && (
+          <ToolCallsFooter calls={m.toolCalls} />
+        )}
       </div>
+    </div>
+  );
+}
+
+// Cross-agent tool-call footer ("🔧 Used: @location, @reviews · 1.4s")
+function ToolCallsFooter({ calls }: { calls: ToolCall[] }) {
+  const [open, setOpen] = useState(false);
+  // Aggregate by owning agent for the collapsed summary
+  const agentSet = new Set<string>();
+  let totalMs = 0;
+  for (const c of calls) {
+    const owner = c.tool.split("__")[0]; // e.g. "location"
+    agentSet.add(owner);
+    totalMs += c.latency_ms || 0;
+  }
+  const agents = Array.from(agentSet);
+  return (
+    <div className="mt-2 text-[11px]">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="inline-flex items-center gap-1 text-stone-500 hover:text-stone-800 transition"
+        title="Cross-agent tool calls made for this turn"
+      >
+        <span>🔧</span>
+        <span>
+          Used:{" "}
+          {agents.map((a, i) => (
+            <span key={a}>
+              <span className="font-mono text-stone-700">@{a}</span>
+              {i < agents.length - 1 ? ", " : ""}
+            </span>
+          ))}
+          {" · "}
+          {(totalMs / 1000).toFixed(1)}s · {calls.length} call
+          {calls.length !== 1 ? "s" : ""}
+        </span>
+        <span className="text-stone-400">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <ul className="mt-1.5 ml-4 space-y-0.5 text-stone-500">
+          {calls.map((c, i) => {
+            const [owner, fn] = c.tool.split("__");
+            return (
+              <li key={i} className="font-mono">
+                <span className="text-stone-700">@{owner}</span>
+                <span className="text-stone-400">.{fn}</span>
+                <span className="text-stone-300"> · {c.latency_ms}ms</span>
+                {c.error ? (
+                  <span className="ml-2 text-red-600">err: {c.error}</span>
+                ) : (
+                  <span className="ml-2 text-stone-400">{c.result_preview}</span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
     </div>
   );
 }

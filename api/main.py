@@ -48,7 +48,10 @@ async def lifespan(app: FastAPI):
     STATE["profile_updater"] = ProfileUpdater()
     STATE["agents"] = {
         "search": SearchAgent(listings, ranker=ranker),
-        "property": PropertyAnalystAgent(),
+        # Property is the pilot for cross-agent tool-use; needs the full
+        # listings pool so its `search__find_listings` tool can search
+        # beyond the current shortlist scope.
+        "property": PropertyAnalystAgent(all_listings=listings),
         "location": LocationCommuteAgent(),
         "outreach": OutreachAgent(),
         "reviews": ResidentReviewsAgent(),
@@ -95,6 +98,11 @@ class ChatResponse(BaseModel):
     profile: dict
     profile_summary: str
     shortlist: list[dict]
+    # Cross-agent tool-call log — when the lead agent calls another
+    # agent's tool (e.g. property → location.get_walkability), each
+    # call is recorded so the frontend can render a "🔧 Used:" footer
+    # under the message bubble. Empty when the lead used no tools.
+    tool_calls: list[dict] = []
 
 
 class ShortlistMutation(BaseModel):
@@ -313,6 +321,7 @@ def chat(req: ChatRequest):
         profile=_profile_dict(session),
         profile_summary=session.profile.to_summary(),
         shortlist=session.shortlist_payload(),
+        tool_calls=getattr(reply, "tool_calls", []) or [],
     )
 
 
