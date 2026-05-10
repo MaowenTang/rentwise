@@ -65,7 +65,7 @@ except ImportError:
         """Stub: returns [] until reviews_fetcher.py is implemented."""
         return []
 
-    def get_reviews_or_fetch(zpid: str, listing_stub: dict) -> list[dict]:  # type: ignore[misc]
+    async def get_reviews_or_fetch(zpid: str, listing_stub: dict) -> list[dict]:  # type: ignore[misc]
         """Stub: returns [] until reviews_fetcher.py is implemented."""
         return []
 
