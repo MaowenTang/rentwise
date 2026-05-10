@@ -48,6 +48,7 @@ ReviewsResult dict schema (one record per data source):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import date
@@ -392,7 +393,7 @@ class ResidentReviewsAgent(BaseAgent):
         # NOTE: No streaming preamble in v1 — frontend uses single-shot JSON.
         # When SSE lands (v1.1), emit a preamble chunk here before this call.
         listing_stub = self._listing_stub(session, zpid)
-        records = get_reviews_or_fetch(zpid, listing_stub)
+        records = asyncio.run(get_reviews_or_fetch(zpid, listing_stub))
 
         # ── Step 3: no data at all ───────────────────────────────────────
         if not records:
