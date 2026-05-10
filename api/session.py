@@ -45,6 +45,9 @@ class Session:
     # When an agent asks a clarifying question, we remember which agent is
     # waiting for a reply so the next user message can be routed back to it.
     pending_clarification: tuple[str, list[str]] | None = None
+    # zpids the user has already seen in search results — excluded from re-search
+    # so Dynamic Feedback Loop never surfaces the same listing twice.
+    shown_zpids: set[str] = field(default_factory=set)
 
     def add_to_shortlist(self, listing: Listing, via: str) -> bool:
         """Returns True if newly added, False if already present."""

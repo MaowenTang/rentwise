@@ -280,13 +280,15 @@ class SearchAgent(BaseAgent):
             )
 
         # Hard-filter by profile, then score everything that passes.
+        # Pass full pets/neighborhoods lists — filter_listings now handles
+        # multi-value correctly (all pets required; any neighborhood matches).
         filtered = filter_listings(
             self.listings,
             max_rent=profile.budget_max,
             min_beds=profile.beds_min,
             max_beds=profile.beds_max,
-            pets=profile.pets[0] if profile.pets else None,
-            neighborhood=profile.neighborhoods[0] if profile.neighborhoods else None,
+            pets=profile.pets or None,
+            neighborhoods=profile.neighborhoods or None,
         )
         if not filtered:
             # Soft-fallback: drop neighborhood filter
@@ -295,7 +297,7 @@ class SearchAgent(BaseAgent):
                 max_rent=profile.budget_max,
                 min_beds=profile.beds_min,
                 max_beds=profile.beds_max,
-                pets=profile.pets[0] if profile.pets else None,
+                pets=profile.pets or None,
             )
             relax_msg = " (relaxed neighborhood filter to find matches)" if filtered else ""
         else:
@@ -317,9 +319,10 @@ class SearchAgent(BaseAgent):
         if relax_msg:
             note = (note or "") + relax_msg
 
-        # Auto-add top 5 to shortlist
+        # Auto-add top 5 to shortlist; record shown zpids for re-search exclusion
         for L in ranked:
             session.add_to_shortlist(L, via="search")
+            session.shown_zpids.add(L.zpid)
         session.listings_in_scope = ranked
         session.rescore_shortlist(self.ranker)
 

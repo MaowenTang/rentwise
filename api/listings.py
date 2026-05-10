@@ -635,15 +635,32 @@ def filter_listings(
     max_rent: int | None = None,
     min_beds: int | None = None,
     max_beds: int | None = None,
-    pets: str | None = None,  # "dogs", "cats", or None
+    pets: list[str] | str | None = None,   # list of required pets OR single string
+    neighborhoods: list[str] | str | None = None,  # list of acceptable neighborhoods OR single string
+    # Legacy alias kept for callers that pass keyword `neighborhood=`
     neighborhood: str | None = None,
 ) -> list[Listing]:
-    out: list[Listing] = []
-    target_city: str | None = None
-    sub_area: str | None = None
-    if neighborhood:
-        target_city, sub_area = parse_location_phrase(neighborhood)
+    # Normalise pets to list
+    if isinstance(pets, str):
+        pets_list: list[str] = [pets] if pets else []
+    else:
+        pets_list = list(pets) if pets else []
 
+    # Normalise neighborhoods to list (merge legacy `neighborhood` kwarg)
+    nbhd_raw: list[str] = []
+    if isinstance(neighborhoods, str):
+        nbhd_raw = [neighborhoods] if neighborhoods else []
+    elif neighborhoods:
+        nbhd_raw = list(neighborhoods)
+    if neighborhood:
+        nbhd_raw.append(neighborhood)
+
+    # Pre-parse each neighborhood phrase into (city, sub_area)
+    parsed_nbhds: list[tuple[str | None, str | None]] = [
+        parse_location_phrase(n) for n in nbhd_raw
+    ]
+
+    out: list[Listing] = []
     for L in listings:
         if max_rent is not None:
             # If user specified a budget, REJECT listings without known rent.
@@ -658,25 +675,35 @@ def filter_listings(
         if max_beds is not None and L.rent_by_bed:
             if not any(b <= max_beds for b in L.rent_by_bed):
                 continue
-        if pets:
+
+        # Pets: ALL required pets must be allowed (logical AND across the list)
+        if pets_list:
             allowed = {p.lower() for p in (L.pets_allowed or [])}
-            if not any(pets.lower() in a for a in allowed):
+            if not all(any(req.lower() in a for a in allowed) for req in pets_list):
                 continue
-        # City filter (hard) — derived from the neighborhood phrase.
-        # Without this, "san francisco downtown" used to fall through and
-        # show San Jose listings ranked higher on cheap rent. Once city
-        # is locked, sub_area is left as a ranking signal (handled in
-        # RankingService) — being strict on sub-area excludes nearby
-        # neighborhoods like SoMa/Tenderloin from a "SF downtown" search.
-        if target_city is not None:
-            listing_city = (L.raw or {}).get("city") or ""
-            if listing_city.lower() != target_city.lower():
+
+        # Neighborhoods: listing must match AT LEAST ONE entry (logical OR)
+        # City filter (hard) derived from the neighborhood phrase; sub-area
+        # is left as a ranking signal in RankingService.
+        if parsed_nbhds:
+            listing_city = ((L.raw or {}).get("city") or "").lower()
+            ln = (L.neighborhood or "").lower()
+            matched_any = False
+            for target_city, sub_area in parsed_nbhds:
+                if target_city is not None:
+                    if listing_city == target_city.lower():
+                        matched_any = True
+                        break
+                elif ln and nbhd_raw:
+                    # Legacy substring fallback for sub-area names
+                    for nbhd in nbhd_raw:
+                        if nbhd.lower() in ln:
+                            matched_any = True
+                            break
+                    if matched_any:
+                        break
+            if not matched_any:
                 continue
-        elif neighborhood and L.neighborhood:
-            # Phrase didn't parse to a known city → fall back to
-            # legacy substring match against Listing.neighborhood
-            # (e.g. user typed "Willow Glen", "Mission District").
-            if neighborhood.lower() not in L.neighborhood.lower():
-                continue
+
         out.append(L)
     return out

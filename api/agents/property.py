@@ -102,7 +102,7 @@ def resolve_listings(message: str, in_scope: list[Listing]) -> list[Listing]:
         return []
     msg = message.lower()
 
-    # Ordinal references: "first", "second", "1st", "#2"
+    # Ordinal references: "first", "second", "1st", "#2", "第一", "第二", …
     # NOTE: cardinals ("one", "two", "three") deliberately excluded — they
     # match too liberally ("the one I like", "two of these", etc.).
     ordinals = {
@@ -111,6 +111,17 @@ def resolve_listings(message: str, in_scope: list[Listing]) -> list[Listing]:
         "third": 2, "3rd": 2,
         "fourth": 3, "4th": 3,
         "fifth": 4, "5th": 4,
+        # Chinese ordinals
+        "第一": 0, "第1": 0,
+        "第二": 1, "第2": 1,
+        "第三": 2, "第3": 2,
+        "第四": 3, "第4": 3,
+        "第五": 4, "第5": 4,
+        "第六": 5, "第6": 5,
+        "第七": 6, "第7": 6,
+        "第八": 7, "第8": 7,
+        "第九": 8, "第9": 8,
+        "第十": 9, "第10": 9,
     }
     indexes: set[int] = set()
     for word, idx in ordinals.items():
@@ -196,9 +207,13 @@ class PropertyAnalystAgent(BaseAgent):
             session.listings_in_scope.index(L) + 1 for L in likely_targets
         ]
 
-        # Always include FULL scope (with zpids) so tool-call args reference
-        # listings the model can actually see.
-        scope = session.listings_in_scope[:5]
+        # Build LLM scope: start with up to 15 in-scope listings, then
+        # ensure every resolved target is included even if it's beyond that
+        # window (fixes the bug where listing #6+ couldn't be analysed).
+        scope = list(session.listings_in_scope[:15])
+        for L in likely_targets:
+            if L not in scope:
+                scope.append(L)
         cards = []
         for i, L in enumerate(scope):
             card = listing_card_for_llm(L, i)

@@ -173,13 +173,14 @@ class RankingService:
         weighted_total = 0.0
 
         # Budget
-        if profile.budget_max:
-            if listing.rent_min is None:
-                s = 0.0
-            elif listing.rent_min <= profile.budget_max * 0.85:
-                s = 10.0  # well under
+        if profile.budget_max and listing.rent_min is not None:
+            # Skip this component entirely when rent is unknown — Apartments.com
+            # listings have 0% rent coverage and scoring them 0 would unfairly
+            # bury them behind listings with known (but expensive) rents.
+            if listing.rent_min <= profile.budget_max * 0.85:
+                s = 10.0  # well under budget
             elif listing.rent_min <= profile.budget_max:
-                # scale 5-10 between 85% and 100% of budget
+                # scale 5–10 between 85% and 100% of budget
                 ratio = (profile.budget_max - listing.rent_min) / (profile.budget_max * 0.15)
                 s = 5 + 5 * ratio
             else:
