@@ -29,7 +29,11 @@ Available agents:
       • "show me cheaper options"
       • "any pet-friendly studios?"
       • "what other places are like that one?"
-    中文 re-search signals (ALWAYS route to search):
+    "Show Me More" / next-batch signals (ALWAYS route to search, no
+    profile update needed — SearchAgent handles the fast-path internally):
+      • "show me more" / "more options" / "next batch" / "see more"
+      • "再推几个" / "看更多" / "再来几个" / "多看几个" / "多推几个"
+    中文 re-search with new criteria (ALWAYS route to search):
       • "再找几个" / "换几个看看" / "还有其他的吗"
       • "这些都不太好" / "有没有其他选择" / "再搜一下"
       • "找便宜一点的" / "有没有更好的"

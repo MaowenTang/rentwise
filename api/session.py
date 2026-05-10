@@ -48,6 +48,10 @@ class Session:
     # zpids the user has already seen in search results — excluded from re-search
     # so Dynamic Feedback Loop never surfaces the same listing twice.
     shown_zpids: set[str] = field(default_factory=set)
+    # Full heuristic-sorted candidate pool from the last search, used by the
+    # "Show Me More" fast-path to paginate without re-scoring or LLM ranking.
+    # Replaced on every full re-search; cleared when profile changes materially.
+    search_candidate_pool: list[Listing] = field(default_factory=list)
 
     def add_to_shortlist(self, listing: Listing, via: str) -> bool:
         """Returns True if newly added, False if already present."""

@@ -11,6 +11,7 @@ Flow:
 from __future__ import annotations
 
 import json
+import re
 import threading
 from dataclasses import asdict
 
@@ -18,6 +19,15 @@ from listings import Listing, filter_listings
 from profile import RankingService, UserProfile
 
 from .base import AgentReply, BaseAgent
+
+# "Show Me More" — user wants the next batch of listings without changing
+# their search criteria.  Matched before the full search pipeline runs so
+# we can fast-path from the stored candidate pool (no re-score, no LLM call).
+_SHOW_MORE_RE = re.compile(
+    r"\b(show\s+me\s+more|more\s+options|more\s+listings|next\s+batch|see\s+more|load\s+more)\b"
+    r"|再推几个|还有其他的吗|看更多|再来几个|多看几个|再多看|多推几个",
+    re.IGNORECASE,
+)
 
 # Reviews pre-warm — best-effort background fetch for top results.
 # Deferred import so SearchAgent still works if reviews_fetcher.py isn't ready.
@@ -270,6 +280,35 @@ class SearchAgent(BaseAgent):
     def handle(self, message: str, session) -> AgentReply:  # noqa: ANN001
         profile: UserProfile = session.profile
 
+        # ── "Show Me More" fast-path ──────────────────────────────────────────
+        # User wants the next window of results with the same search criteria —
+        # no profile update, no re-scoring, no LLM ranking call.
+        # Requirements (Mira's AC): same sort order, different page.
+        if _SHOW_MORE_RE.search(message) and session.search_candidate_pool:
+            pool = session.search_candidate_pool
+            fresh = [L for L in pool if L.zpid not in session.shown_zpids]
+            if fresh:
+                next_batch = fresh[:5]
+                for L in next_batch:
+                    session.add_to_shortlist(L, via="search")
+                    session.shown_zpids.add(L.zpid)
+                session.listings_in_scope = next_batch
+                session.rescore_shortlist(self.ranker)
+                _prewarm_reviews(next_batch)
+                markdown = self._render(next_batch, None, profile)
+                return AgentReply(
+                    agent=self.name,
+                    text=markdown,
+                    metadata={
+                        "phase": "results",
+                        "next_batch": True,
+                        "ranked_zpids": [L.zpid for L in next_batch],
+                        "profile_summary": profile.to_summary(),
+                    },
+                )
+            # Pool exhausted — fall through to a fresh full search below so
+            # the user at least gets something (pool will be refreshed).
+
         if not profile.is_rich_enough():
             question = self._clarify(message, profile)
             return AgentReply(
@@ -327,6 +366,12 @@ class SearchAgent(BaseAgent):
 
         scored = [(L, self.ranker.score(L, profile)) for L in filtered]
         scored.sort(key=lambda t: -t[1].overall)
+
+        # Persist the full heuristic-sorted pool for "Show Me More" pagination.
+        # Stored BEFORE LLM selection so the pool is stable (same sort order)
+        # across multiple "show me more" calls without re-scoring.
+        session.search_candidate_pool = [L for L, _ in scored]
+
         ranked, note = self._llm_rank(profile, scored)
         if relax_msg:
             note = (note or "") + relax_msg
