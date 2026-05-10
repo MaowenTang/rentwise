@@ -169,8 +169,10 @@ class SearchAgent(BaseAgent):
         }
 
     def _llm_rank(self, profile: UserProfile, scored: list[tuple[Listing, "ScoreBreakdown"]]) -> tuple[list[Listing], str | None]:
-        # scored is already sorted descending by overall score; cap at 25
-        top = scored[:25]
+        # scored is already sorted descending by overall score; cap at 50
+        # (bumped from 25 now that semantic blend helps the LLM distinguish
+        # listings with similar heuristic scores via description quality)
+        top = scored[:50]
         cards = [self._candidate_card(L, s) for L, s in top]
         prompt = RANK_PROMPT.format(
             profile_json=json.dumps(asdict(profile), default=str, indent=2),

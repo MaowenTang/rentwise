@@ -26,7 +26,7 @@ from agents.reviews import ResidentReviewsAgent
 from agents.router import AgentRouter
 from agents.search import SearchAgent
 from listings import load_listings
-from profile import ProfileUpdater, RankingService
+from profile import ProfileUpdater, RankingService, SemanticRanker
 from session import ChatTurn, SessionStore
 
 load_dotenv()
@@ -41,7 +41,16 @@ async def lifespan(app: FastAPI):
     LOG.info("loading listings...")
     listings = load_listings()
     LOG.info("loaded %d listings", len(listings))
-    ranker = RankingService()
+
+    # P3 — Pre-compute semantic embeddings (bge-small-en-v1.5 via fastembed).
+    # Runs in the startup coroutine so embeddings are ready before the first
+    # request. On first deploy this downloads ~130 MB of ONNX weights; Render
+    # caches them on disk across restarts. Degrades gracefully when fastembed
+    # is not installed (SemanticRanker warns and semantic component is skipped).
+    semantic = SemanticRanker()
+    semantic.precompute(listings)
+
+    ranker = RankingService(semantic=semantic)
     STATE["listings"] = listings
     STATE["ranker"] = ranker
     STATE["sessions"] = SessionStore()

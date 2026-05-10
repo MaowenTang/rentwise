@@ -7,12 +7,27 @@ returns a 0-100 overall score plus per-feature breakdown for the UI.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from math import asin, cos, radians, sin, sqrt
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
 
 from anthropic import Anthropic
 
 from listings import Listing
+
+# fastembed is an optional dependency (lighter than sentence-transformers;
+# uses ONNX runtime, no PyTorch required). The app degrades gracefully when
+# it's not installed — P3 semantic component is simply skipped.
+try:
+    from fastembed import TextEmbedding as _FastTextEmbedding
+    _FASTEMBED_OK = True
+except ImportError:
+    _FASTEMBED_OK = False
+
+LOG = logging.getLogger(__name__)
 
 EARTH_MI = 3958.7613
 
@@ -138,6 +153,125 @@ class ScoreBreakdown:
     explanation: str                  # human-readable why
 
 
+class SemanticRanker:
+    """P3 — bge-small-en-v1.5 cosine similarity as a RankingService component.
+
+    Lifecycle:
+      1. Call precompute(listings) once at startup to build the embedding index.
+         Only listings with a non-empty description are indexed. Takes ~2-5 s
+         for 3 k listings on first run (model download ~130 MB); subsequent
+         runs use the fastembed ONNX cache.
+      2. RankingService.score() calls similarity(zpid, profile) per listing.
+         Returns None when the listing has no embedding or the profile has no
+         textual signal — component is simply skipped.
+
+    Embed dimension: 384 (bge-small-en-v1.5).
+    Memory: ~5 MB for 3 k listings × 384 dims × float32.
+    """
+
+    MODEL_NAME = "BAAI/bge-small-en-v1.5"
+    _DESCRIPTION_MAX = 600   # truncate description before embedding
+
+    def __init__(self) -> None:
+        self._model: Any = None
+        self._embeddings: dict[str, np.ndarray] = {}   # zpid → unit-normed vec
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _model_instance(self):
+        if self._model is None:
+            if not _FASTEMBED_OK:
+                raise RuntimeError("fastembed is not installed")
+            self._model = _FastTextEmbedding(self.MODEL_NAME)
+        return self._model
+
+    @staticmethod
+    def _unit(vec: np.ndarray) -> np.ndarray:
+        n = float(np.linalg.norm(vec))
+        return vec / n if n > 0 else vec
+
+    def _build_query_text(self, profile: UserProfile) -> str | None:
+        """Construct a natural-language query sentence from the profile."""
+        parts: list[str] = []
+        if profile.budget_max:
+            parts.append(f"max rent ${profile.budget_max:,} per month")
+        if profile.beds_min is not None:
+            label = "studio" if profile.beds_min == 0 else f"{profile.beds_min} bedroom"
+            parts.append(f"{label} apartment")
+        if profile.pets:
+            parts.append(f"pet friendly, allows {' and '.join(profile.pets)}")
+        if profile.must_haves:
+            parts.append(f"must have: {', '.join(profile.must_haves[:5])}")
+        if profile.nice_to_haves:
+            parts.append(f"nice to have: {', '.join(profile.nice_to_haves[:3])}")
+        if profile.commute:
+            parts.append(f"close to {profile.commute.name}")
+        if profile.neighborhoods:
+            parts.append(f"neighborhood: {', '.join(profile.neighborhoods[:2])}")
+        if profile.notes and len(profile.notes) > 10:
+            parts.append(profile.notes[:200])
+        if not parts:
+            return None
+        return ". ".join(parts)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def precompute(self, listings: list[Listing]) -> None:
+        """Pre-compute and store unit-normed embeddings for all indexed listings.
+
+        Safe to call multiple times (idempotent — re-indexes any new listings).
+        Skips listings without a description or zpid.
+        Logs a summary on completion.
+        """
+        if not _FASTEMBED_OK:
+            LOG.warning("P3 semantic ranking disabled: fastembed not installed")
+            return
+
+        texts: list[str] = []
+        zpids: list[str] = []
+        for L in listings:
+            if L.zpid and L.description and L.zpid not in self._embeddings:
+                texts.append(L.description[: self._DESCRIPTION_MAX])
+                zpids.append(L.zpid)
+
+        if not texts:
+            LOG.info("SemanticRanker: no new listings to index (total=%d)", len(self._embeddings))
+            return
+
+        LOG.info("SemanticRanker: indexing %d listings …", len(texts))
+        model = self._model_instance()
+        vecs = list(model.embed(texts))
+        for zpid, vec in zip(zpids, vecs):
+            self._embeddings[zpid] = self._unit(np.array(vec, dtype="float32"))
+        LOG.info(
+            "SemanticRanker: indexed %d listings (total=%d)",
+            len(texts), len(self._embeddings),
+        )
+
+    def similarity(self, zpid: str, profile: UserProfile) -> float | None:
+        """Return cosine similarity in [0, 1], or None when not available.
+
+        Cosine sim with unit-normed vectors = dot product.
+        Range shrinks to [0, 1] for non-negative embeddings (bge produces this).
+        """
+        if not zpid or zpid not in self._embeddings:
+            return None
+        query_text = self._build_query_text(profile)
+        if query_text is None:
+            return None
+        try:
+            model = self._model_instance()
+            q_vec = self._unit(np.array(next(model.embed([query_text])), dtype="float32"))
+            return float(np.dot(self._embeddings[zpid], q_vec))
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("SemanticRanker.similarity error: %s", exc)
+            return None
+
+
 class RankingService:
     """Heuristic scoring — fast, deterministic, explainable.
 
@@ -156,12 +290,19 @@ class RankingService:
         "walk_score": 1.0,
         "transit_score": 0.5,
         "neighborhood": 1.5,
+        # P3 semantic blend — bge-small-en-v1.5 cosine similarity.
+        # Weight 2.0 makes it influential but not dominant; heuristic signals
+        # (budget, beds, pets) still anchor the ranking.
+        "semantic": 2.0,
         # Sound score (HowLoud Soundscore via apartments.com): 0=very loud,
         # 100=very quiet. We invert and rescale: quiet listings score high.
         # Default weight is small; users who pick "quiet" in onboarding get
         # this bumped via profile.weights.
         "sound_score": 0.8,
     }
+
+    def __init__(self, semantic: SemanticRanker | None = None) -> None:
+        self._semantic = semantic
 
     def score(self, listing: Listing, profile: UserProfile) -> ScoreBreakdown:
         comps: dict[str, float] = {}
@@ -305,6 +446,20 @@ class RankingService:
             comps["sound_score"] = round(s, 1)
             active_weight += weights["sound_score"]
             weighted_total += s * weights["sound_score"]
+
+        # P3 — Semantic similarity (bge-small-en-v1.5 cosine sim).
+        # Only active when SemanticRanker is wired up AND the listing was indexed
+        # (has a description) AND the profile has enough textual signal to embed.
+        if self._semantic is not None:
+            sim = self._semantic.similarity(listing.zpid or "", profile)
+            if sim is not None:
+                # Cosine sim is in [0, 1] for bge positive embeddings.
+                # Scale to [0, 10].
+                s = max(0.0, min(10.0, sim * 10))
+                comps["semantic"] = round(s, 1)
+                w = weights.get("semantic", 2.0)
+                active_weight += w
+                weighted_total += s * w
 
         overall = (weighted_total / active_weight) * 10 if active_weight else 50.0
         explanation = self._explain(comps)
