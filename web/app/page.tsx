@@ -1422,6 +1422,11 @@ function ShortlistCard({
 }) {
   const [expanded, setExpanded] = useState(false);
   const hasCoords = item.lat !== null && item.lng !== null;
+  // Issue 2: show neighborhood as display name when address is undisclosed
+  const isUndisclosed = !item.name || item.name === "(Undisclosed Address)";
+  const displayName = isUndisclosed
+    ? (item.neighborhood || "(Undisclosed Address)")
+    : item.name;
   const score = item.score ?? 0;
   const scoreColor =
     score >= 85
@@ -1482,12 +1487,15 @@ function ShortlistCard({
           </div>
         </div>
         <div className="flex-1 min-w-0">
-          <div className="text-sm font-medium text-stone-900 truncate" title={item.name}>
-            {item.name}
+          <div className="text-sm font-medium text-stone-900 truncate" title={displayName}>
+            {displayName}
           </div>
-          <div className="text-xs text-stone-500 truncate">
-            {item.neighborhood || "—"}
-          </div>
+          {/* Hide neighborhood row when it's already used as the display name */}
+          {!isUndisclosed && (
+            <div className="text-xs text-stone-500 truncate">
+              {item.neighborhood || "—"}
+            </div>
+          )}
           <div className="mt-1 space-y-0.5">
             {bedEntries.map(([label, range]) => (
               <div
@@ -1504,7 +1512,21 @@ function ShortlistCard({
           <div className="flex items-center gap-2 mt-1.5 text-[10px] text-stone-500">
             {item.walk_score != null && <span>walk {item.walk_score}</span>}
             {item.transit_score != null && <span>transit {item.transit_score}</span>}
-            <span className="ml-auto">via {item.added_via}</span>
+            <div className="ml-auto flex items-center gap-2">
+              {/* Issue 1: always-visible Zillow link (not buried in WHY expand) */}
+              {item.url && (
+                <a
+                  href={item.url}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  onClick={(e) => e.stopPropagation()}
+                  className="text-emerald-700 hover:underline"
+                >
+                  Zillow ↗
+                </a>
+              )}
+              <span>via {item.added_via}</span>
+            </div>
           </div>
         </div>
         <button
@@ -1539,16 +1561,6 @@ function ShortlistCard({
                   <span className="w-8 text-right text-stone-600 font-mono">{v.toFixed(1)}</span>
                 </div>
               ))}
-              {item.url && (
-                <a
-                  href={item.url}
-                  target="_blank"
-                  rel="noreferrer noopener"
-                  className="block text-[11px] text-emerald-700 hover:underline mt-2"
-                >
-                  Open on Zillow ↗
-                </a>
-              )}
             </div>
           )}
         </div>
