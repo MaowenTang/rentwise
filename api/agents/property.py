@@ -149,11 +149,23 @@ def resolve_listings(message: str, in_scope: list[Listing]) -> list[Listing]:
     return [in_scope[i] for i in picks if i < len(in_scope)]
 
 
+def _display_address(L: "Listing") -> str | None:
+    """Return address suitable for LLM prompts.
+
+    Falls back to neighborhood when Zillow hides the exact address so the LLM
+    doesn't echo "(Undisclosed Address)" verbatim in its reply.
+    """
+    addr = (L.address or "").strip()
+    if not addr or addr.lower() == "(undisclosed address)":
+        return L.neighborhood or None
+    return addr
+
+
 def listing_card_for_llm(L: Listing, idx: int) -> dict:
     return {
         "index": idx + 1,
         "name": L.name,
-        "address": L.address,
+        "address": _display_address(L),
         "neighborhood": L.neighborhood,
         "rent_min": L.rent_min,
         "rent_max": L.rent_max,
