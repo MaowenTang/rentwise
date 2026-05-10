@@ -31,8 +31,9 @@ Cache backend:
           when Supabase is provisioned — same interface, swap the backend.
 
 Live fetch sources (in priority order):
-    1. Google Places API  — review text + aggregate rating (GOOGLE_PLACES_API_KEY)
-       TODO: implement when cedar-t provides GCP key
+    1. Google Places API (New) — review text + aggregate rating (GOOGLE_PLACES_API_KEY)
+       POST places.googleapis.com/v1/places:searchText → up to 5 reviews + rating
+       Requires "Places API (New)" enabled in GCP (not the legacy "Places API").
     2. Yelp Fusion API    — aggregate rating only (YELP_API_KEY)
        /v3/businesses/search → rating + review_count + url
        Note: /v3/businesses/{id}/reviews returns 404 on the free tier.
@@ -276,30 +277,116 @@ async def _fetch_yelp(listing_stub: dict, client: httpx.AsyncClient) -> ReviewsR
 
 
 # ---------------------------------------------------------------------------
-# Live fetch: Google Places (TODO — requires GOOGLE_PLACES_API_KEY)
+# Live fetch: Google Places (New) — review text + aggregate rating
 # ---------------------------------------------------------------------------
 async def _fetch_google_places(listing_stub: dict, client: httpx.AsyncClient) -> ReviewsResult | None:
-    """Fetch Google Places reviews for a listing.
+    """Fetch Google Places (New) reviews for a listing.
 
-    TODO: implement when cedar-t provides GOOGLE_PLACES_API_KEY in Render env.
+    Endpoint: POST https://places.googleapis.com/v1/places:searchText
+    Returns up to 5 review texts plus aggregate rating from Google Maps.
 
-    Planned endpoint:
-        POST https://places.googleapis.com/v1/places:searchText
-        Body: {"textQuery": f"{name} apartments {city}", "maxResultCount": 1}
-        Headers: {"X-Goog-Api-Key": api_key,
-                  "X-Goog-FieldMask": "places.id,places.displayName,places.rating,
-                                        places.userRatingCount,places.reviews,
-                                        places.googleMapsUri,places.location"}
+    listing_stub expected keys: name, address, lat (float|None), lng (float|None)
+    The 'city' key is optional; address typically includes city already.
 
-    Returns a full ReviewsResult with individual review text when available.
-    One API call covers both URL discovery (P4) and review text.
-    ~$0.017/call × 2,000 listings ≈ $34 one-time.
+    Verification: haversine distance ≤500m from listing coords.
+    ~$0.017/call — cost is acceptable for on-demand user-triggered fetches.
     """
     api_key = os.environ.get("GOOGLE_PLACES_API_KEY", "")
     if not api_key:
-        return None  # not yet configured — will be populated when GCP key arrives
-    # TODO: implement the actual Places API call here
-    return None
+        return None
+
+    name = listing_stub.get("name", "")
+    address = listing_stub.get("address", "")
+    lat = listing_stub.get("lat")
+    lng = listing_stub.get("lng")
+
+    # Build text query: "Building Name, Full Address" gives best match precision
+    query = f"{name}, {address}".strip(", ") if address else name
+    if not query:
+        return None
+
+    try:
+        resp = await client.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            json={"textQuery": query, "maxResultCount": 1},
+            headers={
+                "X-Goog-Api-Key": api_key,
+                "X-Goog-FieldMask": (
+                    "places.id,places.displayName,places.rating,"
+                    "places.userRatingCount,places.reviews,"
+                    "places.googleMapsUri,places.location"
+                ),
+            },
+            timeout=FETCH_TIMEOUT_S,
+        )
+        if resp.status_code != 200:
+            LOG.warning(
+                "Google Places API error %s for %s: %s",
+                resp.status_code, name, resp.text[:300],
+            )
+            return None
+        places = resp.json().get("places", [])
+        if not places:
+            LOG.debug("Google Places: no results for %r", query)
+            return None
+        place = places[0]
+    except httpx.HTTPError as exc:
+        LOG.warning("Google Places HTTP error for %s: %s", name, exc)
+        return None
+
+    # Haversine distance verification (≤500m required)
+    loc = place.get("location", {})
+    place_lat = loc.get("latitude")
+    place_lng = loc.get("longitude")
+    verified = False
+    verified_by = "google_text_match"
+
+    if lat and lng and place_lat and place_lng:
+        dist_m = _haversine_m(lat, lng, place_lat, place_lng)
+        if dist_m > 500:
+            LOG.debug("Google Places: %s discarded — %.0fm away from listing coords", name, dist_m)
+            return None
+        verified = True
+        verified_by = "haversine_500m"
+    elif not lat:
+        verified_by = "no_coords"
+
+    rating = place.get("rating")
+    review_count = place.get("userRatingCount")
+    maps_url = place.get("googleMapsUri")
+
+    # Parse review texts (API returns up to 5)
+    raw_reviews = place.get("reviews") or []
+    reviews: list[dict] = []
+    for r in raw_reviews:
+        # text field is a LocalizedText object: {"text": "...", "languageCode": "en"}
+        text_obj = r.get("text") or {}
+        text = (
+            text_obj.get("text", "").strip()
+            if isinstance(text_obj, dict)
+            else str(text_obj).strip()
+        )
+        if not text:
+            continue
+        publish_time = r.get("publishTime", "")
+        reviews.append({
+            "text": text,
+            "rating": r.get("rating"),
+            "date": publish_time[:10] if publish_time else None,
+            "author": (r.get("authorAttribution") or {}).get("displayName"),
+        })
+
+    return {
+        "source": "google_places",
+        "rating": float(rating) if rating is not None else None,
+        "review_count": int(review_count) if review_count is not None else None,
+        "verified": verified,
+        "verified_by": verified_by,
+        "aggregate_only": len(reviews) == 0,
+        "fetched_at": _now_iso(),
+        "url": maps_url,
+        "reviews": reviews if reviews else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -335,16 +422,19 @@ def get_reviews(zpid: str) -> list[ReviewsResult]:
 
     Returns [] on miss — does NOT trigger a live fetch.
     Intended for SearchAgent's background pre-warm: call this after the top-5
-    results are determined; if [], schedule get_reviews_or_fetch() as a
-    background task so the cache is warm by the time the user drills in.
+    results are determined; if [], spawn a daemon thread that calls
+    asyncio.run(get_reviews_or_fetch(...)) so the cache is warm by the time
+    the user drills into a listing.
 
-    Usage:
-        # In SearchAgent, after top-5 are returned:
-        for listing in top_5:
-            if not get_reviews(listing.zpid):
-                asyncio.create_task(
-                    get_reviews_or_fetch(listing.zpid, listing_stub_for(listing))
-                )
+    Usage (SearchAgent daemon-thread pattern):
+        # In SearchAgent._prewarm_reviews():
+        def _fetch_one(zpid, stub):
+            try:
+                if not get_reviews(zpid):
+                    asyncio.run(get_reviews_or_fetch(zpid, stub))
+            except Exception:
+                pass
+        threading.Thread(target=_fetch_one, args=(zpid, stub), daemon=True).start()
     """
     _load_cache()
     if _cache_is_fresh(zpid):
