@@ -162,7 +162,14 @@ class SearchAgent(BaseAgent):
         return {
             "zpid": L.zpid,
             "name": L.name,
-            "address": L.address,
+            # Use neighborhood as address fallback when Zillow hides the exact
+            # address — prevents "(Undisclosed Address)" from appearing in the
+            # LLM rationale text the user sees in chat.
+            "address": (
+                L.address
+                if L.address and L.address.strip() != "(Undisclosed Address)"
+                else (L.neighborhood or "address not available")
+            ),
             "neighborhood": L.neighborhood,
             "rent_min": L.rent_min,
             "rent_max": L.rent_max,
