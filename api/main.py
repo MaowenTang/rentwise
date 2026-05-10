@@ -43,12 +43,19 @@ async def lifespan(app: FastAPI):
     LOG.info("loaded %d listings", len(listings))
 
     # P3 — Pre-compute semantic embeddings (bge-small-en-v1.5 via fastembed).
-    # Runs in the startup coroutine so embeddings are ready before the first
-    # request. On first deploy this downloads ~130 MB of ONNX weights; Render
-    # caches them on disk across restarts. Degrades gracefully when fastembed
-    # is not installed (SemanticRanker warns and semantic component is skipped).
-    semantic = SemanticRanker()
-    semantic.precompute(listings)
+    # Gated behind ENABLE_SEMANTIC_RANKING env var (default: false) so the
+    # 130 MB ONNX model download and ~200-250 MB resident RAM cost are only
+    # incurred when the host has headroom.  On Render free tier (512 MB RAM,
+    # ephemeral disk — model re-downloads on every deploy) keep this off;
+    # flip to "true" when upgrading to a paid plan with persistent disk.
+    # The heuristic ranker continues to work correctly when this is off.
+    semantic: SemanticRanker | None = None
+    if os.environ.get("ENABLE_SEMANTIC_RANKING", "false").lower() == "true":
+        LOG.info("P3 semantic ranking enabled — pre-computing embeddings...")
+        semantic = SemanticRanker()
+        semantic.precompute(listings)
+    else:
+        LOG.info("P3 semantic ranking disabled (set ENABLE_SEMANTIC_RANKING=true to enable)")
 
     ranker = RankingService(semantic=semantic)
     STATE["listings"] = listings
