@@ -248,28 +248,39 @@ class RankingService:
         if profile.commute and profile.commute.lat and profile.commute.lng \
                 and listing.lat and listing.lng:
             miles = haversine(listing.lat, listing.lng, profile.commute.lat, profile.commute.lng)
-            # Rough: <3 mi = 10, 3-6 = 8, 6-10 = 5, 10-15 = 3, >15 = 1
-            if miles < 3:
-                s = 10.0
-            elif miles < 6:
-                s = 8.0
-            elif miles < 10:
-                s = 5.0
-            elif miles < 15:
-                s = 3.0
-            else:
-                s = 1.0
+            # Linear interpolation: full score (10) at 0 mi, min score (1) at max_mi.
+            # If user set max_minutes (e.g. "30 min commute"), estimate max miles via
+            # ~30 mph average (conservative; mostly surface streets in SJ/SF).
+            # Otherwise default ceiling is 15 miles.
+            max_mi = (profile.commute.max_minutes / 2.0) if profile.commute.max_minutes else 15.0
+            max_mi = max(max_mi, 1.0)  # guard against 0
+            s = max(1.0, 10.0 - (miles / max_mi) * 9.0)
             comps["commute"] = round(s, 1)
             active_weight += weights["commute"]
             weighted_total += s * weights["commute"]
 
-        # Walk / transit
-        if listing.walk_score is not None:
+        # Walk / transit — only activated when the user has expressed a preference
+        # for walkability or transit (or has a commute target, for which transit
+        # relevance is implied).  Avoids penalising car-centric users who never
+        # mentioned walkability.
+        _pref_blob = " ".join(
+            profile.must_haves + profile.nice_to_haves
+        ).lower()
+        _walk_pref = bool(profile.commute) or any(
+            kw in _pref_blob
+            for kw in ("walk", "walkab", "pedestrian")
+        )
+        _transit_pref = bool(profile.commute) or any(
+            kw in _pref_blob
+            for kw in ("transit", "bart", "vta", "caltrain", "bus", "subway", "metro", "train")
+        )
+
+        if listing.walk_score is not None and _walk_pref:
             s = min(10.0, listing.walk_score / 10)
             comps["walk_score"] = round(s, 1)
             active_weight += weights["walk_score"]
             weighted_total += s * weights["walk_score"]
-        if listing.transit_score is not None:
+        if listing.transit_score is not None and _transit_pref:
             s = min(10.0, listing.transit_score / 10)
             comps["transit_score"] = round(s, 1)
             active_weight += weights["transit_score"]

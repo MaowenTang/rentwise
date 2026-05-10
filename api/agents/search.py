@@ -70,8 +70,9 @@ Ask ONE concise, friendly question that would most improve the search.
 Prioritize what's missing in this order:
   1. budget (max monthly rent)
   2. bed count (studio? 1BR? 2BR?)
-  3. location signal (commute target like a workplace, OR preferred neighborhoods)
-  4. must-haves (pets, parking, in-unit laundry, pool, etc.)
+  3. pets (do they have any? this is a hard filter — critical to know early)
+  4. location signal (commute target like a workplace, OR preferred neighborhoods)
+  5. other must-haves (parking, in-unit laundry, pool, etc.)
 
 Already-known profile:
 {profile_summary}
@@ -312,6 +313,15 @@ class SearchAgent(BaseAgent):
                 ),
                 metadata={"phase": "no_results", "profile_summary": profile.to_summary()},
             )
+
+        # Dynamic Feedback Loop — exclude listings already shown this session so
+        # re-searches surface fresh options instead of repeating the same results.
+        # If exclusion empties the pool (user has seen everything), fall through
+        # with all candidates so they at least get something.
+        if session.shown_zpids:
+            fresh = [L for L in filtered if L.zpid not in session.shown_zpids]
+            if fresh:
+                filtered = fresh
 
         scored = [(L, self.ranker.score(L, profile)) for L in filtered]
         scored.sort(key=lambda t: -t[1].overall)
