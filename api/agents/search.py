@@ -250,7 +250,20 @@ r/bayarea, etc.), prefer rationales that ground in that real-world signal:
   • Don't fabricate quotes — reference the signal qualitatively only.
   • Don't include reddit signal if it's mixed/neutral (close to 0).
 
-Return ONLY a JSON array (no prose, no fences):
+TOOL USE (optional, sparingly):
+  Before finalizing your top 5, you MAY call cross-agent tools on AT MOST
+  2-3 candidates if the heuristic signal is ambiguous or you want to
+  break a tie with concrete evidence. Best uses:
+    • reviews__summarize(zpid) — check resident sentiment on a strong
+      contender before recommending it (catches "Vespr" landmines).
+    • location__get_walkability(zpid) — verify amenity density when
+      walk_score alone seems borderline.
+    • location__get_commute(zpid) — sanity-check commute when the
+      heuristic commute_score looks suspicious.
+  DO NOT call tools on every candidate — pick 1-3 surgical lookups that
+  actually shift the ranking. Budget is 5 tool calls total per turn.
+
+After any tool calls, return your final JSON array (no prose, no fences):
 [
   {{"zpid": "...", "rationale": "..."}}, ...
 ]
@@ -368,7 +381,7 @@ class SearchAgent(BaseAgent):
             "_community_signal": _community_evidence_for(L),
         }
 
-    def _llm_rank(self, profile: UserProfile, scored: list[tuple[Listing, "ScoreBreakdown"]]) -> tuple[list[Listing], str | None]:
+    def _llm_rank(self, profile: UserProfile, scored: list[tuple[Listing, "ScoreBreakdown"]]) -> tuple[list[Listing], str | None, list[dict]]:
         # scored is already sorted descending by overall score; cap at 50
         # (bumped from 25 now that semantic blend helps the LLM distinguish
         # listings with similar heuristic scores via description quality)
@@ -379,12 +392,29 @@ class SearchAgent(BaseAgent):
             n=len(cards),
             candidates=json.dumps(cards, indent=2),
         )
-        resp = self.client.messages.create(
-            model=self.model,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = resp.content[0].text
+        # Tool-use loop so Search can selectively ping Reviews/Location
+        # on ambiguous candidates before locking in top 5. The scope is
+        # the top-50 candidates (tools key on zpid via scope param).
+        scope = [L for L, _ in top]
+        try:
+            raw, tool_logs = self.tool_use_loop(
+                prompt,
+                scope=scope,
+                all_listings=self.listings,
+                max_tokens=2000,
+                max_calls=5,
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger("rentwise.api").warning("search tool loop failed: %s", e)
+            tool_logs = []
+            # Fall back to plain single-shot call
+            resp = self.client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text
         text = _strip_fences(raw)
         try:
             picks = json.loads(text)
@@ -394,7 +424,7 @@ class SearchAgent(BaseAgent):
                 "rank parse failed: %s | raw[:200]=%r | stripped[:200]=%r",
                 e, raw[:200], text[:200],
             )
-            return [L for L, _ in top[:5]], None  # silently fall back; error already logged above
+            return [L for L, _ in top[:5]], None, tool_logs  # silently fall back
 
         note: str | None = None
         if isinstance(picks, list) and picks and isinstance(picks[0], dict) and "_note" in picks[0]:
@@ -415,7 +445,7 @@ class SearchAgent(BaseAgent):
             ranked = [L for L, _ in top[:5]]
         for L in ranked:
             L.raw["_rationale"] = rationales.get(L.zpid, "")
-        return ranked, note
+        return ranked, note, tool_logs
 
     # --- markdown render -------------------------------------------------
 
@@ -595,7 +625,7 @@ class SearchAgent(BaseAgent):
         # across multiple "show me more" calls without re-scoring.
         session.search_candidate_pool = [L for L, _ in scored]
 
-        ranked, note = self._llm_rank(profile, scored)
+        ranked, note, tool_logs = self._llm_rank(profile, scored)
         if relax_msg:
             note = (note or "") + relax_msg
 
@@ -632,4 +662,5 @@ class SearchAgent(BaseAgent):
                 "ranked_zpids": [L.zpid for L in ranked],
                 "profile_summary": profile.to_summary(),
             },
+            tool_calls=tool_logs or [],
         )
