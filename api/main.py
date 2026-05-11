@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -88,6 +88,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RentWise API", version="0.0.3", lifespan=lifespan)
+
+# --- Auth + user persistence ------------------------------------------------
+from db import init_db, log_chat_event, log_interaction, save_profile, load_profile  # noqa: E402
+from auth import router as auth_router, get_current_user, get_current_user_optional  # noqa: E402
+
+init_db()
+app.include_router(auth_router)
 
 # CORS — accept localhost (dev) + any explicit origins from CORS_ORIGINS env
 # (comma-separated). Plus any *.vercel.app preview/prod domain via regex.
@@ -281,7 +288,7 @@ def _hydrate_session_from_client(session, req: "ChatRequest") -> bool:
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, current_user=Depends(get_current_user_optional)):
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not key.startswith("sk-") or "..." in key:
         raise HTTPException(
@@ -290,6 +297,19 @@ def chat(req: ChatRequest):
 
     sessions: SessionStore = STATE["sessions"]
     session = sessions.get(req.session_id)
+
+    # Authed users: seed empty session with their persisted profile (so a
+    # fresh tab on Render still has their long-term preferences).
+    if current_user and not session.history and not session.profile.budget_max:
+        stored = load_profile(current_user.id)
+        if stored:
+            try:
+                session.profile = _profile_from_dict(stored)
+                LOG.info("[%s] loaded persisted profile for user %s",
+                         req.session_id[:8], current_user.email)
+            except Exception as e:
+                LOG.warning("[%s] failed to load profile for %s: %s",
+                            req.session_id[:8], current_user.email, e)
 
     # Re-hydrate from frontend mirror if the session is empty (e.g. backend
     # restarted between turns and lost in-memory state).
@@ -302,6 +322,9 @@ def chat(req: ChatRequest):
         )
 
     session.history.append(ChatTurn(role="user", agent=None, text=req.message))
+
+    # Snapshot profile before LLM update — used for training log
+    profile_before_dict = _profile_dict(session) if current_user else None
 
     # 1. Update profile from this turn (parallel-safe with router because
     #    router doesn't read the profile, but the search agent does).
@@ -339,11 +362,37 @@ def chat(req: ChatRequest):
     ranker: RankingService = STATE["ranker"]
     session.rescore_shortlist(ranker)
 
+    # 5. Persist for authed users: latest profile snapshot + chat event log.
+    chat_event_id = None
+    if current_user:
+        try:
+            save_profile(current_user.id, _profile_dict(session))
+            ranked_zpids = (reply.metadata or {}).get("ranked_zpids") or [
+                e.listing.zpid for e in session.shortlist[:5]
+            ]
+            chat_event_id = log_chat_event(
+                user_id=current_user.id,
+                session_id=req.session_id,
+                user_message=req.message,
+                agent_id=reply.agent,
+                router_reason=reason,
+                profile_before=profile_before_dict,
+                profile_after=_profile_dict(session),
+                ranked_zpids=ranked_zpids,
+                reply_text=reply.text,
+            )
+        except Exception as e:
+            LOG.warning("[%s] persistence failed: %s", req.session_id[:8], e)
+
+    response_metadata = dict(reply.metadata or {})
+    if chat_event_id:
+        response_metadata["chat_event_id"] = chat_event_id
+
     return ChatResponse(
         reply=reply.text,
         agent=reply.agent,
         router_reason=reason,
-        metadata=reply.metadata,
+        metadata=response_metadata,
         profile=_profile_dict(session),
         profile_summary=session.profile.to_summary(),
         shortlist=session.shortlist_payload(),
@@ -352,14 +401,86 @@ def chat(req: ChatRequest):
 
 
 @app.post("/shortlist/remove")
-def shortlist_remove(req: ShortlistMutation):
+def shortlist_remove(req: ShortlistMutation, current_user=Depends(get_current_user_optional)):
     session = STATE["sessions"].get(req.session_id)
     removed = session.remove_from_shortlist(req.zpid)
     session.rescore_shortlist(STATE["ranker"])
+    if current_user and removed:
+        try:
+            log_interaction(
+                user_id=current_user.id, session_id=req.session_id,
+                event_type="remove", zpid=req.zpid,
+            )
+        except Exception as e:
+            LOG.warning("interaction log failed: %s", e)
     return {
         "ok": True,
         "removed": removed,
         "shortlist": session.shortlist_payload(),
+    }
+
+
+# --- Interaction logging (training data signal) -----------------------------
+
+class InteractionEvent(BaseModel):
+    session_id: str
+    event_type: str            # "click" | "save" | "show_more" | etc.
+    zpid: str | None = None
+    rank_position: int | None = None
+    chat_event_id: str | None = None
+    extra: dict | None = None
+
+
+@app.post("/events/track")
+def events_track(req: InteractionEvent, current_user=Depends(get_current_user_optional)):
+    """Receive frontend events: which listing was clicked / saved / etc.
+    Anonymous users get a 204-equivalent no-op; only authed users have
+    rows written. Used to build a preference-learning dataset.
+    """
+    if not current_user:
+        return {"ok": True, "logged": False}
+    try:
+        iid = log_interaction(
+            user_id=current_user.id,
+            session_id=req.session_id,
+            event_type=req.event_type,
+            zpid=req.zpid,
+            rank_position=req.rank_position,
+            chat_event_id=req.chat_event_id,
+            extra=req.extra,
+        )
+        return {"ok": True, "logged": True, "event_id": iid}
+    except Exception as e:
+        LOG.warning("events_track failed: %s", e)
+        raise HTTPException(status_code=500, detail="event log failed")
+
+
+@app.get("/events/my-history")
+def my_history(current_user=Depends(get_current_user), limit: int = 50):
+    """Authed user can see their own chat history (debugging / transparency)."""
+    import sqlite3
+    from db import DB_PATH
+    with sqlite3.connect(str(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, session_id, timestamp, user_message, agent_id, "
+            "       ranked_zpids_json "
+            "FROM chat_events WHERE user_id = ? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (current_user.id, limit),
+        ).fetchall()
+    return {
+        "events": [
+            {
+                "id": r["id"],
+                "session_id": r["session_id"],
+                "timestamp": r["timestamp"],
+                "message": r["user_message"],
+                "agent": r["agent_id"],
+                "ranked_zpids": __import__("json").loads(r["ranked_zpids_json"] or "[]"),
+            }
+            for r in rows
+        ]
     }
 
 

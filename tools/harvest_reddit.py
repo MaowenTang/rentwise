@@ -32,6 +32,21 @@ SUBREDDITS = [
     "AskSF",
     "oakland",
     "bayarea",
+    # Expanded coverage:
+    "RentingHouse",      # cross-region renter advice
+    "berkeley",          # UC Berkeley area
+    "PaloAlto",
+    "MountainView",
+    "Sunnyvale",
+    "Cupertino",
+    "SantaClara",
+    "FremontCa",
+    "Hayward",
+    "RedwoodCity",
+    "SanMateoCa",
+    "Burlingame",        # may be small but worth a pass
+    "AskBayArea",
+    "movingtoSF",
 ]
 
 # Apartment-hunting query terms — Reddit's search is full-text.

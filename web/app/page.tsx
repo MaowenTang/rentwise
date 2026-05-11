@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import MapCard from "../components/map-card";
 import type { MapPin } from "../components/map-card";
+import { AuthModal, type AuthUser } from "../components/auth-modal";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -92,6 +93,14 @@ type ShortlistItem = {
   photo_url: string | null;
   type_label: string | null;
   rationale: string | null;
+  // Reddit social proof — populated when SearchAgent matched this building
+  // to a Reddit mention in api/data/reddit_building_mentions.jsonl.
+  social_proof: {
+    sentiment: "positive" | "negative" | "mixed";
+    quote: string;
+    subreddit: string;
+    permalink: string;
+  } | null;
 };
 
 const AGENTS: {
@@ -187,6 +196,28 @@ export default function Home() {
   const [shortlist, setShortlist] = useState<ShortlistItem[]>([]);
   const [healthOk, setHealthOk] = useState<boolean | null>(null);
   const [keyOk, setKeyOk] = useState<boolean | null>(null);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+
+  // Restore auth from localStorage on first mount
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const t = localStorage.getItem("rw_token");
+    const u = localStorage.getItem("rw_user");
+    if (t && u) {
+      try {
+        setAuthUser(JSON.parse(u) as AuthUser);
+      } catch {
+        // ignore
+      }
+    }
+  }, []);
+
+  function signOut() {
+    localStorage.removeItem("rw_token");
+    localStorage.removeItem("rw_user");
+    setAuthUser(null);
+  }
   const [listingCount, setListingCount] = useState<number | null>(null);
   const [showOnboarding, setShowOnboarding] = useState(true);
   // Mobile drawer state — both default-closed; only used below md breakpoint.
@@ -237,9 +268,12 @@ export default function Home() {
     setInput("");
     setBusy(true);
     try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const authToken = typeof window !== "undefined" ? localStorage.getItem("rw_token") : null;
+      if (authToken) headers.Authorization = `Bearer ${authToken}`;
       const r = await fetchWithRetry(`${API}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
           session_id: sessionId,
           message: text,
@@ -554,6 +588,26 @@ export default function Home() {
             {listingCount != null && ` · ${listingCount.toLocaleString()} Bay Area listings (Zillow + Craigslist)`}
             {" · "}live shortlist on the right
           </div>
+          <div className="ml-auto flex items-center gap-2 text-xs">
+            {authUser ? (
+              <>
+                <span className="text-stone-600">{authUser.email}</span>
+                <button
+                  onClick={signOut}
+                  className="text-stone-500 hover:text-stone-800 underline"
+                >
+                  Sign out
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => setAuthModalOpen(true)}
+                className="px-3 py-1 bg-emerald-700 text-white rounded hover:bg-emerald-800 font-medium"
+              >
+                Sign in to save preferences
+              </button>
+            )}
+          </div>
         </header>
 
         <ChatScroll
@@ -583,6 +637,14 @@ export default function Home() {
         activeZpid={activeZpid}
         setActiveZpid={setActiveZpid}
         mapPanToRef={mapPanToRef}
+      />
+      <AuthModal
+        open={authModalOpen}
+        onClose={() => setAuthModalOpen(false)}
+        onSuccess={(user) => {
+          setAuthUser(user);
+          setAuthModalOpen(false);
+        }}
       />
     </div>
   );
@@ -1528,6 +1590,29 @@ function ShortlistCard({
               <span>via {item.added_via}</span>
             </div>
           </div>
+          {/* Reddit social proof — a real quote about this building from a
+              named subreddit, attached when SearchAgent matched the building
+              name to api/data/reddit_building_mentions.jsonl. */}
+          {item.social_proof && (
+            <a
+              href={item.social_proof.permalink}
+              target="_blank"
+              rel="noreferrer noopener"
+              onClick={(e) => e.stopPropagation()}
+              className={
+                "block mt-1.5 px-2 py-1 rounded text-[11px] leading-snug border " +
+                (item.social_proof.sentiment === "positive"
+                  ? "bg-emerald-50 border-emerald-200 text-emerald-900 hover:bg-emerald-100"
+                  : item.social_proof.sentiment === "negative"
+                    ? "bg-amber-50 border-amber-200 text-amber-900 hover:bg-amber-100"
+                    : "bg-stone-50 border-stone-200 text-stone-700 hover:bg-stone-100")
+              }
+              title={`From r/${item.social_proof.subreddit} — click to open thread`}
+            >
+              <span className="font-medium">r/{item.social_proof.subreddit}:</span>{" "}
+              "{item.social_proof.quote}"
+            </a>
+          )}
         </div>
         <button
           onClick={(e) => { e.stopPropagation(); onRemove(); }}
@@ -1620,6 +1705,7 @@ function MessageRow({
             photoUrl: s.photo_url,
             rentLabel,
             url: s.url,
+            socialProof: s.social_proof,
           };
         })
     : [];

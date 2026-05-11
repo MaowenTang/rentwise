@@ -19,6 +19,12 @@ export type MapPin = {
   photoUrl?: string | null;
   rentLabel?: string | null;  // e.g. "1BR · $2,595" (formatted by parent)
   url?: string | null;        // Zillow / apartments.com detail link
+  socialProof?: {
+    sentiment: "positive" | "negative" | "mixed";
+    quote: string;
+    subreddit: string;
+    permalink: string;
+  } | null;
 };
 
 type MapCardProps = {
@@ -69,6 +75,26 @@ function buildPopupHtml(pin: MapPin): string {
           style="display:inline-block;margin-top:6px;color:#047857;font-size:11px;font-weight:500;text-decoration:none;">View listing →</a>`
     : "";
 
+  // Reddit social proof (optional) — short colored quote linking to the
+  // original thread. Sentiment drives color, same as ShortlistCard.
+  let socialBlock = "";
+  if (pin.socialProof && pin.socialProof.quote) {
+    const sp = pin.socialProof;
+    const safeQuote = escapeHtml(sp.quote.slice(0, 160));
+    const safeSub = escapeHtml(sp.subreddit || "");
+    const safeLink = /^https?:\/\//i.test(sp.permalink) ? escapeHtml(sp.permalink) : "";
+    const colors = sp.sentiment === "positive"
+      ? { bg: "#ecfdf5", border: "#a7f3d0", text: "#065f46" }
+      : sp.sentiment === "negative"
+        ? { bg: "#fffbeb", border: "#fde68a", text: "#78350f" }
+        : { bg: "#f5f5f4", border: "#d6d3d1", text: "#44403c" };
+    const quoteHtml = `<span style="font-weight:600">r/${safeSub}:</span> "${safeQuote}"`;
+    socialBlock = safeLink
+      ? `<a href="${safeLink}" target="_blank" rel="noopener"
+            style="display:block;margin-top:6px;padding:5px 7px;border:1px solid ${colors.border};background:${colors.bg};color:${colors.text};font-size:10px;line-height:1.35;border-radius:4px;text-decoration:none;">${quoteHtml}</a>`
+      : `<div style="margin-top:6px;padding:5px 7px;border:1px solid ${colors.border};background:${colors.bg};color:${colors.text};font-size:10px;line-height:1.35;border-radius:4px;">${quoteHtml}</div>`;
+  }
+
   return `
     <div style="font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.35;">
       ${photoBlock}
@@ -79,6 +105,7 @@ function buildPopupHtml(pin: MapPin): string {
         </div>
         ${safeRent ? `<div style="font-size:12px;color:#374151;margin-top:2px;">${safeRent}</div>` : ""}
         ${linkBlock}
+        ${socialBlock}
       </div>
     </div>`;
 }

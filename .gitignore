@@ -37,3 +37,8 @@ Thumbs.db
 
 # Yelp API call counter — locally used by tools/scrape_reviews.py, not needed in prod
 tools/data/yelp_call_count.json
+
+# Auth/user SQLite db (runtime state, never commit user data)
+api/data/users.db
+api/data/users.db-*
+

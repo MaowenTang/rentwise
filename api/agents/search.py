@@ -66,6 +66,38 @@ def _normalize_for_match(name: str) -> set[str]:
     )}
 
 
+def _community_evidence_for(listing: Listing) -> dict | None:
+    """Return a small evidence packet for the LLM RANK_PROMPT to cite.
+    Format:
+      {"reddit_neighborhood_sentiment": "+0.31 (55 mentions)",
+       "reddit_building_quote": {"sentiment": "negative",
+                                 "quote": "Avoid Vespr...",
+                                 "subreddit": "oakland"}}
+    Returns None when no signal exists.
+    """
+    out: dict = {}
+    # Neighborhood sentiment
+    from profile import _load_reddit_sentiment
+    sent = _load_reddit_sentiment()
+    nbhd = (listing.neighborhood or "").lower().strip()
+    if nbhd and nbhd in sent:
+        rec = sent[nbhd]
+        out["reddit_neighborhood_sentiment"] = (
+            f"{rec['sentiment_score']:+.2f} "
+            f"(pos={rec['positive_count']}, neg={rec['negative_count']}, "
+            f"mix={rec['mixed_count']}, n={rec['total_mentions']})"
+        )
+    # Building social proof
+    sp = _find_social_proof(listing)
+    if sp:
+        out["reddit_building_quote"] = {
+            "sentiment": sp.get("sentiment"),
+            "quote": (sp.get("quote") or "")[:160],
+            "subreddit": sp.get("subreddit"),
+        }
+    return out or None
+
+
 def _find_social_proof(listing: Listing) -> dict | None:
     """Look up Reddit mentions for this listing's building name. Returns
     the most upvoted negative or positive mention, or None.
@@ -208,6 +240,16 @@ heuristic SCORE but feel free to tie-break on qualitative factors. For
 each pick, write a SHORT one-sentence rationale that ties to the user's
 profile.
 
+When a candidate includes "_community_signal" (Reddit data from r/SanJose,
+r/bayarea, etc.), prefer rationales that ground in that real-world signal:
+  • If reddit_building_quote shows a NEGATIVE sentiment, mention the caveat
+    once (e.g. "Reddit users flag noise issues") but only if the listing
+    still ranks high enough to recommend.
+  • If reddit_neighborhood_sentiment is strongly positive (≥+0.3), cite it
+    ("Mountain View residents describe a quiet, family-friendly vibe").
+  • Don't fabricate quotes — reference the signal qualitatively only.
+  • Don't include reddit signal if it's mixed/neutral (close to 0).
+
 Return ONLY a JSON array (no prose, no fences):
 [
   {{"zpid": "...", "rationale": "..."}}, ...
@@ -320,6 +362,10 @@ class SearchAgent(BaseAgent):
             "url": L.url,
             "_heuristic_score": score.overall,
             "_heuristic_components": score.components,
+            # Community signal evidence — Reddit social proof for this
+            # building (if matched) and neighborhood-level sentiment summary.
+            # Surfaces real user quotes the LLM can cite in rationale.
+            "_community_signal": _community_evidence_for(L),
         }
 
     def _llm_rank(self, profile: UserProfile, scored: list[tuple[Listing, "ScoreBreakdown"]]) -> tuple[list[Listing], str | None]:
