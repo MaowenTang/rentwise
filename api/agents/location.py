@@ -76,6 +76,13 @@ B) ASK — Only ask when truly necessary (e.g. user said "from work"
    without ever specifying where work is, AND there's no commute target
    in profile). Keep questions short (under 200 chars, end with '?').
 
+  CRITICAL: If `context.commute_target` is present, the user's work
+  location is ALREADY KNOWN — do NOT ask where they work. Just use
+  context.commute_target.miles_straight_line_per_listing for distances
+  and approx_minutes_at_30mph for ballpark commute durations. Cite the
+  target by name (e.g. "Your commute to Apple Park is ~10 mi from
+  Sunnyvale → roughly 20 minutes by car off-peak").
+
 USER MESSAGE:
 {user_message}
 
@@ -88,7 +95,7 @@ Reply in concise Markdown — tables work well for comparisons."""
 class LocationCommuteAgent(BaseAgent):
     name = "location"
 
-    def _build_context(self, listings: list[Listing]) -> dict:
+    def _build_context(self, listings: list[Listing], profile=None) -> dict:  # noqa: ANN001
         out = []
         for i, L in enumerate(listings):
             # Extract the rich neighborhood text + highlights so the LLM
@@ -153,7 +160,35 @@ class LocationCommuteAgent(BaseAgent):
                     "description_excerpt": (L.description or "")[:300],
                 }
             )
-        return {"listings": out}
+        ctx: dict = {"listings": out}
+        # Surface the user's known work/commute target so the LLM doesn't
+        # ask "where do you work?" when the profile already has it. Also
+        # pre-compute straight-line distance from each listing to the
+        # commute target since this is the most common question.
+        if profile is not None and getattr(profile, "commute", None):
+            ct = profile.commute
+            target_info = {
+                "name": ct.name,
+                "address": ct.address or None,
+                "lat": ct.lat,
+                "lng": ct.lng,
+                "max_minutes": ct.max_minutes,
+            }
+            if ct.lat and ct.lng:
+                target_info["miles_straight_line_per_listing"] = []
+                for i, L in enumerate(listings):
+                    if L.lat and L.lng:
+                        d = haversine_miles(L.lat, L.lng, ct.lat, ct.lng)
+                        target_info["miles_straight_line_per_listing"].append({
+                            "listing_index": i + 1,
+                            "listing_name": L.name,
+                            "miles": round(d, 2),
+                            # 30 mph surface street estimate; explicit so LLM
+                            # uses it as an approximation rather than guess.
+                            "approx_minutes_at_30mph": int(round(d * 2)),
+                        })
+            ctx["commute_target"] = target_info
+        return ctx
 
     def handle(self, message: str, session) -> AgentReply:  # noqa: ANN001
         if not session.listings_in_scope:
@@ -171,7 +206,7 @@ class LocationCommuteAgent(BaseAgent):
         ]
         # Always include full scope; the LLM picks based on the message + hint.
         targets = session.listings_in_scope[:5]
-        context = self._build_context(targets)
+        context = self._build_context(targets, profile=session.profile)
         if likely_indexes:
             context["_likely_target_indexes_1based"] = likely_indexes
 
