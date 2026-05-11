@@ -21,10 +21,14 @@ from pydantic import BaseModel, EmailStr
 from db import (
     UserRow,
     create_user,
+    delete_memory_key,
     delete_user_cascade,
     export_user_data,
     get_user_by_email,
     get_user_by_id,
+    load_profile,
+    replace_memory,
+    save_memory,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -148,6 +152,63 @@ def export_my_data(user: UserRow = Depends(get_current_user)):
     if not data:
         raise HTTPException(status_code=404, detail="No data found")
     return data
+
+
+# --- Long-term memory CRUD (user-facing; complements auto-extractor) -------
+
+class MemoryUpdate(BaseModel):
+    memory: dict
+
+
+class MemoryPatch(BaseModel):
+    key: str
+    value: str
+
+
+@router.get("/memory")
+def get_memory(user: UserRow = Depends(get_current_user)):
+    """Return current user's long-term memory dict."""
+    _, memory = load_profile(user.id)
+    return {"memory": memory or {}}
+
+
+@router.put("/memory")
+def put_memory(req: MemoryUpdate, user: UserRow = Depends(get_current_user)):
+    """Replace the entire memory dict. Validates that values are short
+    strings (frontend should match the schema the auto-extractor uses).
+    """
+    cleaned: dict[str, str] = {}
+    for k, v in (req.memory or {}).items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        k_clean = k.strip().lower().replace(" ", "_")[:32]
+        v_clean = v.strip()[:200]
+        if k_clean and v_clean:
+            cleaned[k_clean] = v_clean
+    if len(cleaned) > 50:
+        raise HTTPException(status_code=400, detail="Memory limit is 50 keys")
+    replace_memory(user.id, cleaned)
+    return {"ok": True, "memory": cleaned}
+
+
+@router.patch("/memory")
+def patch_memory(req: MemoryPatch, user: UserRow = Depends(get_current_user)):
+    """Upsert a single memory key/value."""
+    k_clean = (req.key or "").strip().lower().replace(" ", "_")[:32]
+    v_clean = (req.value or "").strip()[:200]
+    if not k_clean or not v_clean:
+        raise HTTPException(status_code=400, detail="Key and value required")
+    save_memory(user.id, {k_clean: v_clean})
+    _, memory = load_profile(user.id)
+    return {"ok": True, "memory": memory or {}}
+
+
+@router.delete("/memory/{key}")
+def delete_memory_endpoint(key: str, user: UserRow = Depends(get_current_user)):
+    """Remove a single memory key."""
+    removed = delete_memory_key(user.id, key.strip().lower().replace(" ", "_"))
+    _, memory = load_profile(user.id)
+    return {"ok": True, "removed": removed, "memory": memory or {}}
 
 
 @router.delete("/me")

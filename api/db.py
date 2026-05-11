@@ -222,6 +222,31 @@ def save_memory(user_id: str, memory_dict: dict) -> None:
         conn.commit()
 
 
+def replace_memory(user_id: str, memory_dict: dict) -> None:
+    """Replace entire long-term memory (used by user-facing PUT /memory)."""
+    payload = json.dumps(memory_dict, default=str, ensure_ascii=False)
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO user_profiles(user_id, profile_json, memory_json, updated_at) "
+            "VALUES (?, '{}', ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "memory_json=excluded.memory_json, updated_at=excluded.updated_at",
+            (user_id, payload, now),
+        )
+        conn.commit()
+
+
+def delete_memory_key(user_id: str, key: str) -> bool:
+    """Remove a single key from memory. Returns True if the key existed."""
+    _, existing = load_profile(user_id)
+    if key not in existing:
+        return False
+    del existing[key]
+    replace_memory(user_id, existing)
+    return True
+
+
 # --- chat event log (training data) ---------------------------------------
 
 def log_chat_event(

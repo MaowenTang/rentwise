@@ -7,6 +7,7 @@ import MapCard from "../components/map-card";
 import type { MapPin } from "../components/map-card";
 import { AuthModal, type AuthUser } from "../components/auth-modal";
 import { AccountMenu } from "../components/account-menu";
+import { MemoryModal } from "../components/memory-modal";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -261,6 +262,7 @@ export default function Home() {
   const [keyOk, setKeyOk] = useState<boolean | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [memoryModalOpen, setMemoryModalOpen] = useState(false);
   // Most recent /chat response's event id — attached to subsequent
   // interaction events so they can be joined back to "which turn surfaced
   // this listing" in the chat_events table.
@@ -693,7 +695,11 @@ export default function Home() {
           </div>
           <div className="ml-auto flex items-center gap-2 text-xs">
             {authUser ? (
-              <AccountMenu email={authUser.email} onSignOut={signOut} />
+              <AccountMenu
+                email={authUser.email}
+                onSignOut={signOut}
+                onOpenMemory={() => setMemoryModalOpen(true)}
+              />
             ) : (
               <button
                 onClick={() => setAuthModalOpen(true)}
@@ -740,6 +746,10 @@ export default function Home() {
           setAuthUser(user);
           setAuthModalOpen(false);
         }}
+      />
+      <MemoryModal
+        open={memoryModalOpen}
+        onClose={() => setMemoryModalOpen(false)}
       />
     </div>
   );

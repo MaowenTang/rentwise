@@ -7,9 +7,10 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 type Props = {
   email: string;
   onSignOut: () => void;
+  onOpenMemory?: () => void;
 };
 
-export function AccountMenu({ email, onSignOut }: Props) {
+export function AccountMenu({ email, onSignOut, onOpenMemory }: Props) {
   const [open, setOpen] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -92,6 +93,17 @@ export function AccountMenu({ email, onSignOut }: Props) {
         <div className="absolute right-0 top-full mt-1 w-56 bg-white border border-stone-200 rounded-md shadow-lg z-50 text-xs">
           {!confirming ? (
             <>
+              {onOpenMemory && (
+                <button
+                  onClick={() => {
+                    onOpenMemory();
+                    setOpen(false);
+                  }}
+                  className="block w-full text-left px-3 py-2 hover:bg-stone-50"
+                >
+                  🧠 My memory
+                </button>
+              )}
               <button
                 onClick={downloadData}
                 disabled={busy}
