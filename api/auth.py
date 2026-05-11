@@ -21,6 +21,8 @@ from pydantic import BaseModel, EmailStr
 from db import (
     UserRow,
     create_user,
+    delete_user_cascade,
+    export_user_data,
     get_user_by_email,
     get_user_by_id,
 )
@@ -30,6 +32,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 JWT_SECRET = os.environ.get("JWT_SECRET") or secrets.token_urlsafe(32)
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_DAYS = 30
+MAGIC_LINK_TTL_MINUTES = 15  # short-lived
 
 # bcrypt is hard-capped at 72 bytes. SHA256 the password first → base64
 # (44 ASCII chars, well under 72) → bcrypt. This is the standard bcrypt_sha256
@@ -134,3 +137,200 @@ def login(req: LoginRequest):
 @router.get("/me")
 def me(user: UserRow = Depends(get_current_user)):
     return {"user_id": user.id, "email": user.email, "created_at": user.created_at}
+
+
+@router.get("/export")
+def export_my_data(user: UserRow = Depends(get_current_user)):
+    """GDPR data portability: returns a JSON dump of everything we have
+    on this user. Designed to be downloadable as `rentwise-data.json`.
+    """
+    data = export_user_data(user.id)
+    if not data:
+        raise HTTPException(status_code=404, detail="No data found")
+    return data
+
+
+@router.delete("/me")
+def delete_me(user: UserRow = Depends(get_current_user)):
+    """GDPR right to erasure: cascade-delete this user + all their data.
+    Irreversible. Frontend should clear localStorage tokens after this.
+    """
+    counts = delete_user_cascade(user.id)
+    return {"ok": True, "deleted": counts}
+
+
+# --- Magic-link (passwordless) login ----------------------------------------
+
+class MagicLinkRequest(BaseModel):
+    email: EmailStr
+
+
+class MagicVerifyRequest(BaseModel):
+    token: str
+
+
+def _issue_magic_token(email: str) -> str:
+    """Short-lived JWT just for sign-in link."""
+    payload = {
+        "email": email.lower().strip(),
+        "purpose": "magic_link",
+        "exp": datetime.now(tz=timezone.utc) + timedelta(minutes=MAGIC_LINK_TTL_MINUTES),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def _decode_magic_token(token: str) -> str | None:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("purpose") != "magic_link":
+            return None
+        return payload.get("email")
+    except jwt.PyJWTError:
+        return None
+
+
+def _send_magic_email(email: str, link: str) -> bool:
+    """Send the magic link. Returns True if delivered, False if dev-mode
+    (no SMTP configured). Dev-mode prints the link to stdout so the
+    developer can copy-paste it from the uvicorn log.
+
+    Production: configure SMTP_HOST + SMTP_USER + SMTP_PASSWORD + SMTP_FROM
+    env vars. We use stdlib smtplib so there's no extra dep.
+    """
+    smtp_host = os.environ.get("SMTP_HOST")
+    if not smtp_host:
+        print(f"\n=== MAGIC LINK (dev mode, no SMTP configured) ===")
+        print(f"  To:   {email}")
+        print(f"  Link: {link}")
+        print(f"  Expires in {MAGIC_LINK_TTL_MINUTES} minutes\n")
+        return False
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        sender = os.environ.get("SMTP_FROM", "noreply@rentwise.app")
+        smtp_user = os.environ.get("SMTP_USER")
+        smtp_pass = os.environ.get("SMTP_PASSWORD")
+        smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        msg = MIMEText(
+            f"Click here to sign in to RentWise:\n\n{link}\n\n"
+            f"This link expires in {MAGIC_LINK_TTL_MINUTES} minutes. "
+            f"If you didn't request this, ignore this email."
+        )
+        msg["Subject"] = "Sign in to RentWise"
+        msg["From"] = sender
+        msg["To"] = email
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as s:
+            s.starttls()
+            if smtp_user and smtp_pass:
+                s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
+        return True
+    except Exception as e:
+        # Log but don't reveal error to user (could enumerate accounts)
+        print(f"  SMTP send failed for {email}: {e}")
+        return False
+
+
+@router.post("/magic-link")
+def request_magic_link(req: MagicLinkRequest):
+    """Send a sign-in link to the user's email. If the email is not yet
+    registered, we auto-create the account when they click the link.
+    Always returns 200 to prevent email enumeration; whether SMTP succeeded
+    is not exposed.
+    """
+    base_url = os.environ.get("WEB_BASE_URL", "http://localhost:3000")
+    token = _issue_magic_token(req.email)
+    link = f"{base_url}/auth/magic?token={token}"
+    _send_magic_email(req.email, link)
+    return {"ok": True, "message": "If that email is registered, a sign-in link is on its way."}
+
+
+@router.get("/google/config")
+def google_config():
+    """Frontend uses this to decide whether to show the Google button.
+    Returns the public client_id when configured, or {"enabled": false}.
+    """
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    if not client_id:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "client_id": client_id,
+        "redirect_uri": os.environ.get("WEB_BASE_URL", "http://localhost:3000") + "/auth/google",
+    }
+
+
+class GoogleCallbackRequest(BaseModel):
+    code: str
+    redirect_uri: str
+
+
+@router.post("/google/exchange", response_model=AuthResponse)
+def google_exchange(req: GoogleCallbackRequest):
+    """Exchange a Google OAuth authorization code for our JWT.
+
+    Frontend opens Google consent → Google redirects back to /auth/google
+    with `?code=...`. The frontend page POSTs that code here. We do the
+    server-side token exchange (keeps client_secret out of the browser),
+    fetch userinfo, upsert user, return our app JWT.
+    """
+    client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=503, detail="Google OAuth not configured")
+    import httpx
+    try:
+        tok_resp = httpx.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": req.code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": req.redirect_uri,
+                "grant_type": "authorization_code",
+            },
+            timeout=10.0,
+        )
+        tok_resp.raise_for_status()
+        tok_data = tok_resp.json()
+        access_token = tok_data.get("access_token")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Google token exchange returned no access_token")
+        uinfo = httpx.get(
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10.0,
+        )
+        uinfo.raise_for_status()
+        u = uinfo.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Google OAuth call failed: {e}")
+    email = (u.get("email") or "").lower().strip()
+    if not email or not u.get("email_verified"):
+        raise HTTPException(status_code=403, detail="Google email not verified")
+    found = get_user_by_email(email)
+    if found:
+        user, _ = found
+    else:
+        random_pw_hash = _hash_password(secrets.token_urlsafe(32))
+        user = create_user(email, random_pw_hash)
+    return AuthResponse(token=_issue_token(user.id), user_id=user.id, email=user.email)
+
+
+@router.post("/magic-verify", response_model=AuthResponse)
+def verify_magic_link(req: MagicVerifyRequest):
+    """Exchange a magic-link token for a normal 30-day JWT. Auto-creates
+    user if the email doesn't exist yet (passwordless first-touch signup).
+    """
+    email = _decode_magic_token(req.token)
+    if not email:
+        raise HTTPException(status_code=400, detail="Invalid or expired link")
+    found = get_user_by_email(email)
+    if found:
+        user, _ = found
+    else:
+        # First-time sign-in via magic link: create account with random
+        # password (user can never use it; they always sign in via link).
+        random_pw_hash = _hash_password(secrets.token_urlsafe(32))
+        user = create_user(email, random_pw_hash)
+    return AuthResponse(token=_issue_token(user.id), user_id=user.id, email=user.email)

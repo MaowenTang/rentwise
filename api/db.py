@@ -202,6 +202,89 @@ def log_chat_event(
     return eid
 
 
+def export_user_data(user_id: str) -> dict:
+    """Return all rows for this user across the 4 tables, suitable for
+    GDPR data-portability requests. Returns a dict ready to serialize.
+    """
+    with _connect() as conn:
+        u = conn.execute(
+            "SELECT id, email, created_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        prof = conn.execute(
+            "SELECT profile_json, updated_at FROM user_profiles WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        chats = conn.execute(
+            "SELECT id, session_id, timestamp, user_message, agent_id, "
+            "       router_reason, profile_before_json, profile_after_json, "
+            "       ranked_zpids_json, reply_text "
+            "FROM chat_events WHERE user_id = ? ORDER BY timestamp ASC",
+            (user_id,),
+        ).fetchall()
+        interactions = conn.execute(
+            "SELECT id, session_id, chat_event_id, timestamp, event_type, "
+            "       zpid, rank_position, extra_json "
+            "FROM interaction_events WHERE user_id = ? ORDER BY timestamp ASC",
+            (user_id,),
+        ).fetchall()
+    if not u:
+        return {}
+    return {
+        "user": {"id": u["id"], "email": u["email"], "created_at": u["created_at"]},
+        "profile": {
+            "profile_json": (json.loads(prof["profile_json"]) if prof else None),
+            "updated_at": (prof["updated_at"] if prof else None),
+        },
+        "chat_events": [
+            {
+                "id": r["id"], "session_id": r["session_id"],
+                "timestamp": r["timestamp"], "user_message": r["user_message"],
+                "agent_id": r["agent_id"], "router_reason": r["router_reason"],
+                "profile_before": (
+                    json.loads(r["profile_before_json"]) if r["profile_before_json"] else None
+                ),
+                "profile_after": (
+                    json.loads(r["profile_after_json"]) if r["profile_after_json"] else None
+                ),
+                "ranked_zpids": (
+                    json.loads(r["ranked_zpids_json"]) if r["ranked_zpids_json"] else []
+                ),
+                "reply_text": r["reply_text"],
+            }
+            for r in chats
+        ],
+        "interactions": [
+            {
+                "id": r["id"], "session_id": r["session_id"],
+                "chat_event_id": r["chat_event_id"], "timestamp": r["timestamp"],
+                "event_type": r["event_type"], "zpid": r["zpid"],
+                "rank_position": r["rank_position"],
+                "extra": (json.loads(r["extra_json"]) if r["extra_json"] else None),
+            }
+            for r in interactions
+        ],
+    }
+
+
+def delete_user_cascade(user_id: str) -> dict:
+    """GDPR: irreversibly delete this user's row + all dependent rows
+    across the 4 tables. Returns row counts deleted.
+    """
+    counts = {}
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM interaction_events WHERE user_id = ?", (user_id,))
+        counts["interaction_events"] = cur.rowcount
+        cur = conn.execute("DELETE FROM chat_events WHERE user_id = ?", (user_id,))
+        counts["chat_events"] = cur.rowcount
+        cur = conn.execute("DELETE FROM user_profiles WHERE user_id = ?", (user_id,))
+        counts["user_profiles"] = cur.rowcount
+        cur = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        counts["users"] = cur.rowcount
+        conn.commit()
+    return counts
+
+
 def log_interaction(
     user_id: str,
     session_id: str,

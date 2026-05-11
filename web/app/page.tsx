@@ -6,8 +6,71 @@ import remarkGfm from "remark-gfm";
 import MapCard from "../components/map-card";
 import type { MapPin } from "../components/map-card";
 import { AuthModal, type AuthUser } from "../components/auth-modal";
+import { AccountMenu } from "../components/account-menu";
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+/**
+ * Fire-and-forget interaction event. Silent on failure. Only sends when
+ * the user is signed in (token in localStorage); anonymous users skip.
+ * Module-level so any nested component can call it without prop drilling.
+ *
+ * sessionId is required; chat_event_id should be the most-recent `/chat`
+ * response's metadata.chat_event_id (kept in lastChatEventIdRef at the
+ * Home component).
+ */
+/** Context-free wrapper — reads sessionId + chatEventId from globalThis
+ * (populated by Home on each /chat response). Used by deeply-nested
+ * components (ShortlistCard, etc.) that don't have direct access.
+ */
+export function trackEventGlobal(
+  eventType: "click" | "save" | "remove" | "show_more" | "external_link",
+  zpid: string | null = null,
+  rankPosition: number | null = null,
+  extra?: Record<string, unknown>,
+) {
+  const ctx = (globalThis as {
+    __rwTrackContext?: { sessionId: string; chatEventId: string | null };
+  }).__rwTrackContext;
+  if (!ctx) return;
+  emitTrackEvent({
+    sessionId: ctx.sessionId,
+    eventType,
+    zpid,
+    rankPosition,
+    chatEventId: ctx.chatEventId,
+    extra,
+  });
+}
+
+export function emitTrackEvent(opts: {
+  sessionId: string;
+  eventType: "click" | "save" | "remove" | "show_more" | "external_link";
+  zpid?: string | null;
+  rankPosition?: number | null;
+  chatEventId?: string | null;
+  extra?: Record<string, unknown>;
+}) {
+  if (typeof window === "undefined") return;
+  const token = localStorage.getItem("rw_token");
+  if (!token) return;
+  fetch(`${API}/events/track`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      session_id: opts.sessionId,
+      event_type: opts.eventType,
+      zpid: opts.zpid ?? null,
+      rank_position: opts.rankPosition ?? null,
+      chat_event_id: opts.chatEventId ?? null,
+      extra: opts.extra ?? null,
+    }),
+    keepalive: true,
+  }).catch(() => {});
+}
 
 type AgentId = "search" | "property" | "location" | "outreach" | "reviews";
 type Sender = "user" | "agent" | "system";
@@ -198,6 +261,27 @@ export default function Home() {
   const [keyOk, setKeyOk] = useState<boolean | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
+  // Most recent /chat response's event id — attached to subsequent
+  // interaction events so they can be joined back to "which turn surfaced
+  // this listing" in the chat_events table.
+  const lastChatEventIdRef = useRef<string | null>(null);
+
+  /** Closure-style wrapper around the module-level emitTrackEvent. */
+  function trackEvent(
+    eventType: "click" | "save" | "remove" | "show_more" | "external_link",
+    zpid: string | null,
+    rankPosition: number | null,
+    extra?: Record<string, unknown>,
+  ) {
+    emitTrackEvent({
+      sessionId,
+      eventType,
+      zpid,
+      rankPosition,
+      chatEventId: lastChatEventIdRef.current,
+      extra,
+    });
+  }
 
   // Restore auth from localStorage on first mount
   useEffect(() => {
@@ -325,6 +409,19 @@ export default function Home() {
       setProfileSummary(data.profile_summary || "(no preferences yet)");
       setProfile(data.profile || {});
       setShortlist(data.shortlist || []);
+      // Capture chat_event_id so subsequent click/remove events tie back
+      // to the turn that surfaced the listings.
+      const eid = data.metadata?.chat_event_id;
+      if (typeof eid === "string") {
+        lastChatEventIdRef.current = eid;
+        // Expose to nested components (e.g. ShortlistCard, MapCard) via
+        // globalThis — avoids drilling sessionId + chatEventId through 3
+        // layers of props.
+        (globalThis as { __rwTrackContext?: unknown }).__rwTrackContext = {
+          sessionId,
+          chatEventId: eid,
+        };
+      }
     } catch (e: unknown) {
       setMessages((m) => [
         ...m,
@@ -341,14 +438,20 @@ export default function Home() {
   }
 
   async function removeFromShortlist(zpid: string) {
+    // Find its current rank position before mutation for event log
+    const idx = shortlist.findIndex((s) => s.zpid === zpid);
     try {
+      const token = typeof window !== "undefined" ? localStorage.getItem("rw_token") : null;
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers.Authorization = `Bearer ${token}`;
       const r = await fetchWithRetry(`${API}/shortlist/remove`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ session_id: sessionId, zpid }),
       });
       const data = await r.json();
       setShortlist(data.shortlist || []);
+      trackEvent("remove", zpid, idx >= 0 ? idx + 1 : null);
     } catch {
       // ignore
     }
@@ -590,15 +693,7 @@ export default function Home() {
           </div>
           <div className="ml-auto flex items-center gap-2 text-xs">
             {authUser ? (
-              <>
-                <span className="text-stone-600">{authUser.email}</span>
-                <button
-                  onClick={signOut}
-                  className="text-stone-500 hover:text-stone-800 underline"
-                >
-                  Sign out
-                </button>
-              </>
+              <AccountMenu email={authUser.email} onSignOut={signOut} />
             ) : (
               <button
                 onClick={() => setAuthModalOpen(true)}
@@ -1455,7 +1550,11 @@ function ShortlistRail({
                 if (it.lat !== null && it.lng !== null) {
                   mapPanToRef.current?.(it.lat, it.lng);
                 }
-                setActiveZpid(activeZpid === it.zpid ? null : it.zpid);
+                const willActivate = activeZpid !== it.zpid;
+                setActiveZpid(willActivate ? it.zpid : null);
+                if (willActivate) {
+                  trackEventGlobal("click", it.zpid, i + 1, { target: "card" });
+                }
               }}
             />
           ))
@@ -1581,7 +1680,10 @@ function ShortlistCard({
                   href={item.url}
                   target="_blank"
                   rel="noreferrer noopener"
-                  onClick={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    trackEventGlobal("external_link", item.zpid, rank);
+                  }}
                   className="text-emerald-700 hover:underline"
                 >
                   Zillow ↗
@@ -1598,7 +1700,13 @@ function ShortlistCard({
               href={item.social_proof.permalink}
               target="_blank"
               rel="noreferrer noopener"
-              onClick={(e) => e.stopPropagation()}
+              onClick={(e) => {
+                e.stopPropagation();
+                trackEventGlobal("click", item.zpid, rank, {
+                  target: "social_proof",
+                  subreddit: item.social_proof?.subreddit,
+                });
+              }}
               className={
                 "block mt-1.5 px-2 py-1 rounded text-[11px] leading-snug border " +
                 (item.social_proof.sentiment === "positive"
