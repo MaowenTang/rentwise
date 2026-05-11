@@ -971,7 +971,7 @@ function ChatInput({
         <button
           onClick={onSend}
           disabled={busy || !input.trim()}
-          className="text-xs px-3 py-1.5 rounded bg-stone-900 hover:bg-stone-700 disabled:bg-stone-200 disabled:text-stone-500 transition"
+          className="text-xs font-medium px-3 py-1.5 rounded bg-emerald-700 text-white hover:bg-emerald-800 disabled:bg-stone-100 disabled:text-stone-400 disabled:cursor-not-allowed transition-colors"
         >
           Send
         </button>
