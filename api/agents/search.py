@@ -125,11 +125,51 @@ CANDIDATES:
 
 
 def _strip_fences(text: str) -> str:
+    """Best-effort cleanup before json.loads.
+
+    Handles:
+      • ```json ... ``` code fences
+      • Claude adding a "Sure, here's the ranking:" preamble or post-script
+        — extracts the first [...] balanced JSON array from the text.
+      • Trailing commentary after the array
+    """
     text = text.strip()
     if text.startswith("```"):
         text = text.strip("`")
         if text.lower().startswith("json"):
             text = text[4:].strip()
+    # If text starts with [ or { we're already good. Otherwise try to find
+    # the first JSON array in the response.
+    if not text.startswith(("[", "{")):
+        start = text.find("[")
+        if start == -1:
+            return text  # let json.loads fail loudly
+        # Find matching `]` by depth counting (handles nested arrays).
+        depth = 0
+        end = -1
+        in_str = False
+        esc = False
+        for i, ch in enumerate(text[start:], start=start):
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end != -1:
+            text = text[start:end + 1]
     return text
 
 
@@ -201,11 +241,17 @@ class SearchAgent(BaseAgent):
             max_tokens=2000,
             messages=[{"role": "user", "content": prompt}],
         )
-        text = _strip_fences(resp.content[0].text)
+        raw = resp.content[0].text
+        text = _strip_fences(raw)
         try:
             picks = json.loads(text)
-        except json.JSONDecodeError:
-            return [L for L, _ in top[:5]], "rank parse failed; showing heuristic top 5"
+        except json.JSONDecodeError as e:
+            import logging
+            logging.getLogger("rentwise.api").warning(
+                "rank parse failed: %s | raw[:200]=%r | stripped[:200]=%r",
+                e, raw[:200], text[:200],
+            )
+            return [L for L, _ in top[:5]], None  # silently fall back; error already logged above
 
         note: str | None = None
         if isinstance(picks, list) and picks and isinstance(picks[0], dict) and "_note" in picks[0]:
@@ -370,6 +416,25 @@ class SearchAgent(BaseAgent):
             fresh = [L for L in filtered if L.zpid not in session.shown_zpids]
             if fresh:
                 filtered = fresh
+
+        # Hard pre-filter via RankingService.pre_filter_with_fallback —
+        # tries strict commute cap first, then 1.5x and 2.0x; only as a last
+        # resort drops the commute filter. avoid_cities, furnished, and lease
+        # filters are *never* relaxed (they're true hard constraints).
+        try:
+            hard_filtered, exc = self.ranker.pre_filter_with_fallback(filtered, profile)
+            if hard_filtered:
+                filtered = hard_filtered
+                slack = exc.get("commute_slack")
+                if slack == "dropped":
+                    relax_msg += " (relaxed commute filter — fewer matches in range)"
+                elif isinstance(slack, float) and slack > 1.0:
+                    relax_msg += f" (expanded commute by {int((slack-1)*100)}% to find matches)"
+            # If hard_filtered is empty even after full relaxation, keep the
+            # soft-filtered set rather than returning nothing; ranker.score
+            # will still apply its hard_filter_violated penalty.
+        except Exception:
+            pass  # never break ranking; fall back to soft scoring
 
         scored = [(L, self.ranker.score(L, profile)) for L in filtered]
         scored.sort(key=lambda t: -t[1].overall)
