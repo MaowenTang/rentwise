@@ -89,6 +89,16 @@ CREATE TABLE IF NOT EXISTS interaction_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_interaction_events_user_ts ON interaction_events(user_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL,
+    description   TEXT,
+    variants_json TEXT NOT NULL,   -- {"control": {...}, "treatment": {...}}
+    traffic_split REAL NOT NULL,   -- 0.5 = 50/50, 0.1 = 10% in treatment
+    enabled       INTEGER NOT NULL DEFAULT 0,
+    created_at    REAL NOT NULL
+);
 """
 
 
@@ -175,6 +185,22 @@ def init_db() -> None:
         if not exists:
             try:
                 conn.execute("ALTER TABLE user_profiles ADD COLUMN memory_json TEXT")
+            except Exception:
+                pass
+        # Same migration for chat_events.variant_assignments_json.
+        if IS_POSTGRES:
+            cur = conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ? AND column_name = ?",
+                ("chat_events", "variant_assignments_json"),
+            )
+            vexists = bool(cur.fetchone())
+        else:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(chat_events)").fetchall()]
+            vexists = "variant_assignments_json" in cols
+        if not vexists:
+            try:
+                conn.execute("ALTER TABLE chat_events ADD COLUMN variant_assignments_json TEXT")
             except Exception:
                 pass
         conn.commit()
@@ -337,6 +363,7 @@ def log_chat_event(
     profile_after: dict | None,
     ranked_zpids: list[str] | None,
     reply_text: str | None,
+    variant_assignments: dict | None = None,
 ) -> str:
     """Append a row to chat_events. Returns the event id (UUID)."""
     eid = str(uuid.uuid4())
@@ -344,8 +371,8 @@ def log_chat_event(
         conn.execute(
             "INSERT INTO chat_events(id, user_id, session_id, timestamp, user_message, "
             "agent_id, router_reason, profile_before_json, profile_after_json, "
-            "ranked_zpids_json, reply_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "ranked_zpids_json, reply_text, variant_assignments_json) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 eid, user_id, session_id, time.time(), user_message,
                 agent_id, router_reason,
@@ -353,6 +380,7 @@ def log_chat_event(
                 json.dumps(profile_after, default=str) if profile_after else None,
                 json.dumps(ranked_zpids) if ranked_zpids else None,
                 reply_text,
+                json.dumps(variant_assignments) if variant_assignments else None,
             ),
         )
         conn.commit()
@@ -465,3 +493,181 @@ def log_interaction(
         )
         conn.commit()
     return iid
+
+
+# --- A/B experiments -------------------------------------------------------
+
+def list_active_experiments() -> list[dict]:
+    """Return enabled experiments with parsed variants dict."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, name, description, variants_json, traffic_split, enabled, created_at "
+            "FROM experiments WHERE enabled = 1"
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            variants = json.loads(r["variants_json"])
+        except (json.JSONDecodeError, KeyError):
+            variants = {}
+        out.append({
+            "id": r["id"],
+            "name": r["name"],
+            "description": r["description"],
+            "variants": variants,
+            "traffic_split": r["traffic_split"],
+            "enabled": bool(r["enabled"]),
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+def get_experiment(experiment_id: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT id, name, description, variants_json, traffic_split, enabled, created_at "
+            "FROM experiments WHERE id = ?",
+            (experiment_id,),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        variants = json.loads(row["variants_json"])
+    except (json.JSONDecodeError, KeyError):
+        variants = {}
+    return {
+        "id": row["id"], "name": row["name"], "description": row["description"],
+        "variants": variants, "traffic_split": row["traffic_split"],
+        "enabled": bool(row["enabled"]), "created_at": row["created_at"],
+    }
+
+
+def upsert_experiment(
+    experiment_id: str,
+    name: str,
+    description: str,
+    variants: dict,
+    traffic_split: float,
+    enabled: bool,
+) -> None:
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO experiments(id, name, description, variants_json, "
+            "                        traffic_split, enabled, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "name=excluded.name, description=excluded.description, "
+            "variants_json=excluded.variants_json, traffic_split=excluded.traffic_split, "
+            "enabled=excluded.enabled",
+            (
+                experiment_id, name, description,
+                json.dumps(variants, default=str, ensure_ascii=False),
+                float(traffic_split), 1 if enabled else 0, now,
+            ),
+        )
+        conn.commit()
+
+
+def assign_variant(user_id: str, experiment: dict) -> str:
+    """Deterministic per-user variant assignment.
+
+    Hashes (user_id + experiment_id) so a user stays in the same variant
+    across sessions and across server restarts. For binary 2-variant tests
+    uses traffic_split as the treatment threshold; for multi-variant tests
+    splits the hash space evenly across all variants in name order.
+    """
+    import hashlib
+    variants = experiment.get("variants") or {}
+    if not variants:
+        return ""
+    seed = f"{user_id}:{experiment['id']}".encode("utf-8")
+    h = int(hashlib.md5(seed, usedforsecurity=False).hexdigest(), 16)
+    bucket = (h % 10000) / 10000.0  # [0, 1)
+
+    names = list(variants.keys())
+    if len(names) == 2 and "control" in names:
+        # Binary test: traffic_split = fraction going to NON-control variant
+        treatment = next(n for n in names if n != "control")
+        threshold = float(experiment.get("traffic_split") or 0.5)
+        return treatment if bucket < threshold else "control"
+    # Multi-variant: even split across all variants
+    idx = int(bucket * len(names))
+    return names[idx]
+
+
+def compute_experiment_metrics(experiment_id: str) -> dict:
+    """Aggregate per-variant funnel metrics.
+
+    Reads chat_events.variant_assignments_json + interaction_events to
+    compute:
+      • turns         — # chat_events tagged with this variant
+      • users         — distinct users in this variant
+      • click_rate    — fraction of turns that produced any click within
+                        the next 30 min
+      • save_rate     — same for save events
+      • avg_first_click_rank — mean rank_position of the first click after
+                                a turn (lower is better)
+    """
+    with _connect() as conn:
+        chat_rows = conn.execute(
+            "SELECT id, user_id, session_id, timestamp, variant_assignments_json "
+            "FROM chat_events WHERE variant_assignments_json IS NOT NULL"
+        ).fetchall()
+        inter_rows = conn.execute(
+            "SELECT user_id, session_id, chat_event_id, timestamp, event_type, "
+            "       rank_position "
+            "FROM interaction_events "
+            "WHERE event_type IN ('click', 'save', 'external_link')"
+        ).fetchall()
+
+    # Index interactions by chat_event_id
+    by_chat: dict[str, list[dict]] = {}
+    for r in inter_rows:
+        ceid = r["chat_event_id"]
+        if not ceid:
+            continue
+        by_chat.setdefault(ceid, []).append({
+            "type": r["event_type"],
+            "rank": r["rank_position"],
+        })
+
+    # Aggregate per variant for this experiment
+    agg: dict[str, dict] = {}
+    for r in chat_rows:
+        try:
+            va = json.loads(r["variant_assignments_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        v = va.get(experiment_id)
+        if not v:
+            continue
+        a = agg.setdefault(v, {
+            "turns": 0, "users": set(), "clicks": 0, "saves": 0,
+            "ext_links": 0, "first_click_ranks": [],
+        })
+        a["turns"] += 1
+        a["users"].add(r["user_id"])
+        events = by_chat.get(r["id"], [])
+        if any(e["type"] == "click" or e["type"] == "external_link" for e in events):
+            a["clicks"] += 1
+            ranked = [e["rank"] for e in events if e["type"] in ("click", "external_link") and e["rank"]]
+            if ranked:
+                a["first_click_ranks"].append(min(ranked))
+        if any(e["type"] == "save" for e in events):
+            a["saves"] += 1
+
+    out: dict = {}
+    for v, a in agg.items():
+        turns = a["turns"] or 1
+        out[v] = {
+            "turns": a["turns"],
+            "unique_users": len(a["users"]),
+            "click_rate": round(a["clicks"] / turns, 4),
+            "save_rate": round(a["saves"] / turns, 4),
+            "avg_first_click_rank": (
+                round(sum(a["first_click_ranks"]) / len(a["first_click_ranks"]), 2)
+                if a["first_click_ranks"] else None
+            ),
+        }
+    return out

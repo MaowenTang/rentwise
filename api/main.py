@@ -90,12 +90,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="RentWise API", version="0.0.3", lifespan=lifespan)
 
 # --- Auth + user persistence ------------------------------------------------
-from db import init_db, log_chat_event, log_interaction, save_profile, load_profile, save_memory  # noqa: E402
+from db import (  # noqa: E402
+    init_db, log_chat_event, log_interaction, save_profile, load_profile,
+    save_memory, list_active_experiments, assign_variant,
+)
 from auth import router as auth_router, get_current_user, get_current_user_optional  # noqa: E402
 from memory_extractor import extract_durable_facts  # noqa: E402
 
 init_db()
 app.include_router(auth_router)
+
+from admin import router as admin_router  # noqa: E402
+app.include_router(admin_router)
 
 # CORS — accept localhost (dev) + any explicit origins from CORS_ORIGINS env
 # (comma-separated). Plus any *.vercel.app preview/prod domain via regex.
@@ -350,6 +356,32 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user_optional)):
     agent_id, reason = router.route(req.message, session)
     LOG.info("[%s] route → %s (%s)", req.session_id[:8], agent_id, reason)
 
+    # 2b. A/B experiments: assign this user to every active experiment,
+    # apply any config overrides for the duration of this request. The
+    # subject key is user_id when authed, else session_id (so anonymous
+    # users still get a stable variant within a session).
+    variant_assignments: dict[str, str] = {}
+    try:
+        subject = current_user.id if current_user else f"anon:{req.session_id}"
+        for exp in list_active_experiments():
+            v = assign_variant(subject, exp)
+            if not v:
+                continue
+            variant_assignments[exp["id"]] = v
+            overrides = (exp["variants"] or {}).get(v) or {}
+            # Currently only ranker weight overrides are supported. Extend
+            # as more experimentable surfaces appear.
+            if "ranker_weights" in overrides and isinstance(overrides["ranker_weights"], dict):
+                session.profile.weights = {
+                    **(session.profile.weights or {}),
+                    **overrides["ranker_weights"],
+                }
+        if variant_assignments:
+            LOG.info("[%s] variants: %s",
+                     req.session_id[:8], variant_assignments)
+    except Exception as e:
+        LOG.warning("variant assignment failed: %s", e)
+
     # 3. Dispatch
     agent = STATE["agents"][agent_id]
     reply = agent.handle(req.message, session)
@@ -396,6 +428,7 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user_optional)):
                 profile_after=_profile_dict(session),
                 ranked_zpids=ranked_zpids,
                 reply_text=reply.text,
+                variant_assignments=variant_assignments or None,
             )
         except Exception as e:
             LOG.warning("[%s] persistence failed: %s", req.session_id[:8], e)
