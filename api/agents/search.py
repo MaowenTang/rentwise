@@ -20,6 +20,103 @@ from profile import RankingService, UserProfile
 
 from .base import AgentReply, BaseAgent
 
+# ---------------------------------------------------------------------------
+# Reddit building-mention index — lazy-loaded singleton. Each listing in
+# top 5 gets at most one quote attached via L.raw["_social_proof"], used by
+# session.shortlist_payload to surface on the frontend.
+# ---------------------------------------------------------------------------
+_REDDIT_BUILDING_INDEX: dict[str, list[dict]] | None = None
+
+
+def _load_reddit_building_index() -> dict[str, list[dict]]:
+    global _REDDIT_BUILDING_INDEX
+    if _REDDIT_BUILDING_INDEX is not None:
+        return _REDDIT_BUILDING_INDEX
+    _REDDIT_BUILDING_INDEX = {}
+    import os
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "data" / "reddit_building_mentions.jsonl"
+    if not path.exists():
+        return _REDDIT_BUILDING_INDEX
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                name = (rec.get("building") or "").lower().strip()
+                if name and rec.get("mentions"):
+                    _REDDIT_BUILDING_INDEX[name] = rec["mentions"]
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        pass
+    return _REDDIT_BUILDING_INDEX
+
+
+def _normalize_for_match(name: str) -> set[str]:
+    """Return a set of significant tokens (≥3 chars) for fuzzy matching."""
+    if not name:
+        return set()
+    s = re.sub(r"[^a-z0-9 ]+", " ", name.lower())
+    return {t for t in s.split() if len(t) >= 3 and t not in (
+        "the", "and", "apt", "apts", "san", "ave", "blvd", "los", "del",
+        "via", "way", "rd", "st", "ln", "dr", "ct",
+    )}
+
+
+def _find_social_proof(listing: Listing) -> dict | None:
+    """Look up Reddit mentions for this listing's building name. Returns
+    the most upvoted negative or positive mention, or None.
+
+    Match policy is intentionally strict to prevent false positives like
+    "Oak Grove Apartments" matching a Reddit mention of "The Oak":
+      • Require ≥2 substantive tokens shared, OR
+      • Exactly 1 shared token IF that token is ≥6 chars (unique enough
+        to be a distinctive building name like "miro", "vespr", "avalon"
+        with another qualifier — actually "miro" is 4 chars, hmm)
+      • OR full equality of normalized names
+    """
+    idx = _load_reddit_building_index()
+    if not idx or not listing.name:
+        return None
+    listing_tokens = _normalize_for_match(listing.name)
+    if not listing_tokens:
+        return None
+    best: tuple[int, dict] | None = None  # (token_overlap, mention)
+    for bname, mentions in idx.items():
+        bname_tokens = _normalize_for_match(bname)
+        shared = listing_tokens & bname_tokens
+        if not shared:
+            continue
+        # Strict match policy
+        is_strong_match = False
+        if listing_tokens == bname_tokens:
+            is_strong_match = True
+        elif len(shared) >= 2:
+            is_strong_match = True
+        elif len(shared) == 1:
+            tok = next(iter(shared))
+            # Single-token match only counts if both names are essentially
+            # that one distinctive token (e.g. listing="Miro" + index="miro").
+            if (len(tok) >= 4
+                and len(listing_tokens) == 1
+                and len(bname_tokens) == 1):
+                is_strong_match = True
+        if not is_strong_match:
+            continue
+        # Pick the best-upvoted mention with explicit sentiment.
+        for m in mentions:
+            if m.get("sentiment") not in ("positive", "negative"):
+                continue
+            overlap = len(shared)
+            if best is None or overlap > best[0]:
+                best = (overlap, m)
+            elif overlap == best[0] and m.get("score", 0) > best[1].get("score", 0):
+                best = (overlap, m)
+    return best[1] if best else None
+
 # "Show Me More" — user wants the next batch of listings without changing
 # their search criteria.  Matched before the full search pipeline runs so
 # we can fast-path from the stored candidate pool (no re-score, no LLM call).
@@ -455,6 +552,19 @@ class SearchAgent(BaseAgent):
         ranked, note = self._llm_rank(profile, scored)
         if relax_msg:
             note = (note or "") + relax_msg
+
+        # Attach Reddit social proof (one quote per listing where we found
+        # a matching building mention with explicit sentiment). Lazy-loads
+        # the reddit_building_mentions.jsonl index on first call.
+        for L in ranked:
+            sp = _find_social_proof(L)
+            if sp:
+                L.raw["_social_proof"] = {
+                    "sentiment": sp.get("sentiment"),
+                    "quote": sp.get("quote"),
+                    "subreddit": sp.get("subreddit"),
+                    "permalink": sp.get("permalink"),
+                }
 
         # Auto-add top 5 to shortlist; record shown zpids for re-search exclusion
         for L in ranked:

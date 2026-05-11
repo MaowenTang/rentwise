@@ -105,6 +105,12 @@ class Session:
                     "score_components": e.score.components if e.score else {},
                     "score_explanation": e.score.explanation if e.score else "",
                     "added_via": e.added_via,
+                    # Reddit social proof — attached during SearchAgent ranking
+                    # via L.raw["_social_proof"]. None when no relevant
+                    # community mentions found. Schema:
+                    #   {"sentiment": "negative", "quote": "thin walls...",
+                    #    "subreddit": "SanJose", "permalink": "https://..."}
+                    "social_proof": L.raw.get("_social_proof") or None,
                 }
             )
         return out

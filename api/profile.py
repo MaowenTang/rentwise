@@ -174,6 +174,75 @@ def _review_sentiment_score(
 
 
 # ---------------------------------------------------------------------------
+# Reddit community sentiment — neighborhood-level signal extracted from
+# r/SanJose, r/bayarea, r/BayAreaRealEstate posts. Built by
+# tools/extract_reddit_sentiment.py. Loaded lazily on first use.
+# Schema per line:
+#   {"neighborhood": "willow glen", "sentiment_score": 0.5,
+#    "positive_count": 2, "negative_count": 0, ...}
+# ---------------------------------------------------------------------------
+
+_REDDIT_SENTIMENT: dict[str, dict] | None = None
+
+
+def _load_reddit_sentiment() -> dict[str, dict]:
+    global _REDDIT_SENTIMENT
+    if _REDDIT_SENTIMENT is not None:
+        return _REDDIT_SENTIMENT
+    _REDDIT_SENTIMENT = {}
+    path = (
+        os.path.dirname(os.path.abspath(__file__))
+        + "/data/reddit_neighborhood_sentiment.jsonl"
+    )
+    if not os.path.exists(path):
+        LOG.info("Reddit neighborhood sentiment file not found at %s", path)
+        return _REDDIT_SENTIMENT
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    name = (rec.get("neighborhood") or "").lower().strip()
+                    if name:
+                        _REDDIT_SENTIMENT[name] = rec
+                except json.JSONDecodeError:
+                    continue
+        LOG.info(
+            "Loaded Reddit sentiment for %d neighborhoods",
+            len(_REDDIT_SENTIMENT),
+        )
+    except OSError as e:
+        LOG.warning("reddit sentiment load failed: %s", e)
+    return _REDDIT_SENTIMENT
+
+
+def _community_sentiment_score(listing: Listing) -> float | None:
+    """Map listing.neighborhood / city to a 0-10 score based on aggregated
+    Reddit sentiment. Returns None when no Reddit signal exists.
+    """
+    sent = _load_reddit_sentiment()
+    if not sent:
+        return None
+    candidates: list[str] = []
+    if listing.neighborhood:
+        candidates.append(listing.neighborhood.lower())
+    # Also try parsed city from address
+    if listing.address:
+        parts = [p.strip().lower() for p in listing.address.split(",")]
+        if len(parts) >= 2:
+            candidates.append(parts[-2])
+    for cand in candidates:
+        if cand in sent:
+            # sentiment_score is in [-1, 1]; map to [0, 10]:
+            #   -1 → 0, 0 → 5, +1 → 10
+            return (sent[cand]["sentiment_score"] + 1) * 5
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Verifier registry — replaces naive substring match for must_haves /
 # nice_to_haves. Each verifier maps a preference text → 0-10 score. Returns
 # None when the verifier doesn't apply (so the caller can fall back to a
@@ -851,6 +920,10 @@ class RankingService:
         # gray cards when otherwise-equal listings exist with photos. Small
         # weight so it doesn't sway real decisions, just tie-breaks.
         "has_photo": 0.7,
+        # Community sentiment from Reddit (r/SanJose, r/BayAreaRealEstate, etc.)
+        # — aggregated neighborhood-level signal. Weight ~1.5 — meaningful
+        # but not dominant; people's online opinions are noisy.
+        "community_sentiment": 1.5,
     }
 
     def __init__(self, semantic: SemanticRanker | None = None) -> None:
@@ -1166,6 +1239,15 @@ class RankingService:
                 w = weights.get("reviews", 3.0)
                 active_weight += w
                 weighted_total += rs * w
+
+        # Community sentiment from Reddit (neighborhood-level). Skips when
+        # no Reddit signal exists for this listing's neighborhood/city.
+        cs = _community_sentiment_score(listing)
+        if cs is not None:
+            comps["community_sentiment"] = round(cs, 1)
+            w = weights.get("community_sentiment", 1.5)
+            active_weight += w
+            weighted_total += cs * w
 
         # Has-photo tie-breaker — small weight, always active. Listings with
         # a real photo_url score 10, others 5. Prevents Mapbox showing rows
