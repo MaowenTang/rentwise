@@ -34,3 +34,6 @@ Thumbs.db
 /tmp/
 *.bak
 .vercel
+
+# Yelp API call counter — locally used by tools/scrape_reviews.py, not needed in prod
+tools/data/yelp_call_count.json
