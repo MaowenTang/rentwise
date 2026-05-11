@@ -42,6 +42,12 @@ class Session:
     listings_in_scope: list[Listing] = field(default_factory=list)
     profile: UserProfile = field(default_factory=UserProfile)
     shortlist: list[ShortlistEntry] = field(default_factory=list)
+    # Long-term, cross-session memory for the user (loaded from db on
+    # login). Free-form key→value facts agents can read and append to:
+    # e.g. {"kids": "ages 5 and 8", "vehicle": "F-250 pickup",
+    #       "rejected_zpids": ["cl_xxx", "apt:yyy"]}
+    long_term_memory: dict = field(default_factory=dict)
+    user_id: str | None = None   # set when the request is authenticated
     # When an agent asks a clarifying question, we remember which agent is
     # waiting for a reply so the next user message can be routed back to it.
     pending_clarification: tuple[str, list[str]] | None = None

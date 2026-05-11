@@ -90,8 +90,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="RentWise API", version="0.0.3", lifespan=lifespan)
 
 # --- Auth + user persistence ------------------------------------------------
-from db import init_db, log_chat_event, log_interaction, save_profile, load_profile  # noqa: E402
+from db import init_db, log_chat_event, log_interaction, save_profile, load_profile, save_memory  # noqa: E402
 from auth import router as auth_router, get_current_user, get_current_user_optional  # noqa: E402
+from memory_extractor import extract_durable_facts  # noqa: E402
 
 init_db()
 app.include_router(auth_router)
@@ -298,18 +299,24 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user_optional)):
     sessions: SessionStore = STATE["sessions"]
     session = sessions.get(req.session_id)
 
-    # Authed users: seed empty session with their persisted profile (so a
-    # fresh tab on Render still has their long-term preferences).
-    if current_user and not session.history and not session.profile.budget_max:
-        stored = load_profile(current_user.id)
-        if stored:
-            try:
-                session.profile = _profile_from_dict(stored)
-                LOG.info("[%s] loaded persisted profile for user %s",
-                         req.session_id[:8], current_user.email)
-            except Exception as e:
-                LOG.warning("[%s] failed to load profile for %s: %s",
-                            req.session_id[:8], current_user.email, e)
+    # Authed users: seed empty session with their persisted profile + memory
+    # so cross-tab / cross-restart consistency is preserved.
+    if current_user:
+        session.user_id = current_user.id
+        if not session.history and not session.profile.budget_max:
+            stored_profile, stored_memory = load_profile(current_user.id)
+            if stored_profile:
+                try:
+                    session.profile = _profile_from_dict(stored_profile)
+                    LOG.info("[%s] loaded persisted profile for user %s",
+                             req.session_id[:8], current_user.email)
+                except Exception as e:
+                    LOG.warning("[%s] failed to load profile for %s: %s",
+                                req.session_id[:8], current_user.email, e)
+            if stored_memory:
+                session.long_term_memory = stored_memory
+                LOG.info("[%s] loaded %d long-term memory keys",
+                         req.session_id[:8], len(stored_memory))
 
     # Re-hydrate from frontend mirror if the session is empty (e.g. backend
     # restarted between turns and lost in-memory state).
@@ -366,6 +373,15 @@ def chat(req: ChatRequest, current_user=Depends(get_current_user_optional)):
     chat_event_id = None
     if current_user:
         try:
+            # Extract any new durable facts from this message into long-term
+            # memory (vehicle type, family makeup, etc.). Best-effort; skips
+            # silently on API/JSON errors.
+            new_facts = extract_durable_facts(req.message, session.long_term_memory)
+            if new_facts:
+                session.long_term_memory = {**session.long_term_memory, **new_facts}
+                save_memory(current_user.id, new_facts)
+                LOG.info("[%s] memory +%d keys: %s",
+                         req.session_id[:8], len(new_facts), list(new_facts.keys()))
             save_profile(current_user.id, _profile_dict(session))
             ranked_zpids = (reply.metadata or {}).get("ranked_zpids") or [
                 e.listing.zpid for e in session.shortlist[:5]

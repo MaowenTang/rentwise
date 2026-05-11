@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS user_profiles (
     user_id      TEXT PRIMARY KEY,
     profile_json TEXT NOT NULL,
+    memory_json  TEXT,           -- long-term cross-session memory
     updated_at   REAL NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users(id)
 );
@@ -85,9 +86,19 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create schema if not exists. Idempotent."""
+    """Create schema if not exists. Idempotent. Includes a tiny migration
+    that adds memory_json column to user_profiles if pre-existing rows
+    didn't have it (so the long-term-memory upgrade is non-breaking).
+    """
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+        # Migration: older deploys created user_profiles without memory_json.
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(user_profiles)").fetchall()]
+        if "memory_json" not in cols:
+            try:
+                conn.execute("ALTER TABLE user_profiles ADD COLUMN memory_json TEXT")
+            except Exception:
+                pass
         conn.commit()
 
 
@@ -140,32 +151,75 @@ def get_user_by_id(user_id: str) -> UserRow | None:
 
 # --- profile snapshots -----------------------------------------------------
 
-def save_profile(user_id: str, profile_dict: dict) -> None:
+def save_profile(user_id: str, profile_dict: dict, memory_dict: dict | None = None) -> None:
     payload = json.dumps(profile_dict, default=str, ensure_ascii=False)
+    mem_payload = json.dumps(memory_dict or {}, default=str, ensure_ascii=False) if memory_dict is not None else None
     now = time.time()
     with _connect() as conn:
-        conn.execute(
-            "INSERT INTO user_profiles(user_id, profile_json, updated_at) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET profile_json=excluded.profile_json, "
-            "updated_at=excluded.updated_at",
-            (user_id, payload, now),
-        )
+        # First ensure the row exists with both columns; ON CONFLICT to update
+        # selectively so a save_profile call doesn't clobber existing memory.
+        if mem_payload is not None:
+            conn.execute(
+                "INSERT INTO user_profiles(user_id, profile_json, memory_json, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "profile_json=excluded.profile_json, "
+                "memory_json=excluded.memory_json, "
+                "updated_at=excluded.updated_at",
+                (user_id, payload, mem_payload, now),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO user_profiles(user_id, profile_json, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "profile_json=excluded.profile_json, "
+                "updated_at=excluded.updated_at",
+                (user_id, payload, now),
+            )
         conn.commit()
 
 
-def load_profile(user_id: str) -> dict | None:
+def load_profile(user_id: str) -> tuple[dict | None, dict]:
+    """Return (profile_dict, memory_dict). memory is always a dict (empty
+    if none stored). profile is None when no row exists.
+    """
     with _connect() as conn:
         row = conn.execute(
-            "SELECT profile_json FROM user_profiles WHERE user_id = ?",
+            "SELECT profile_json, memory_json FROM user_profiles WHERE user_id = ?",
             (user_id,),
         ).fetchone()
     if not row:
-        return None
+        return None, {}
     try:
-        return json.loads(row["profile_json"])
+        prof = json.loads(row["profile_json"])
     except (json.JSONDecodeError, KeyError):
-        return None
+        prof = None
+    mem = {}
+    raw_mem = row["memory_json"] if "memory_json" in row.keys() else None
+    if raw_mem:
+        try:
+            mem = json.loads(raw_mem) or {}
+        except json.JSONDecodeError:
+            pass
+    return prof, mem
+
+
+def save_memory(user_id: str, memory_dict: dict) -> None:
+    """Persist long-term memory dict; merges with existing (not replace)."""
+    _, existing = load_profile(user_id)
+    merged = {**existing, **memory_dict}
+    payload = json.dumps(merged, default=str, ensure_ascii=False)
+    now = time.time()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO user_profiles(user_id, profile_json, memory_json, updated_at) "
+            "VALUES (?, '{}', ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "memory_json=excluded.memory_json, updated_at=excluded.updated_at",
+            (user_id, payload, now),
+        )
+        conn.commit()
 
 
 # --- chat event log (training data) ---------------------------------------

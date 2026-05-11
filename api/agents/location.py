@@ -230,9 +230,17 @@ class LocationCommuteAgent(BaseAgent):
             "(needs Google Maps Distance Matrix API — wired up in v1)."
         )
 
-        prompt = ANSWER_PROMPT.format(
-            user_message=message,
-            context=json.dumps(context, indent=2, default=str),
+        from .shared_context import build_shared_context, shared_context_prompt_block
+        shared = build_shared_context(session, current_agent="location")
+        # Inject other agents' recent outputs + long-term memory at the
+        # top of the prompt so the LLM can cross-reference.
+        prompt = (
+            shared_context_prompt_block(shared)
+            + "\n\n"
+            + ANSWER_PROMPT.format(
+                user_message=message,
+                context=json.dumps(context, indent=2, default=str),
+            )
         )
         resp = self.client.messages.create(
             model=self.model,

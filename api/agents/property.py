@@ -84,6 +84,8 @@ B) ASK — Only ask if the question can't be answered without external info
    question, under 200 chars, ends with '?'. Don't ask when data + tools
    are enough.
 
+{shared_context}
+
 LIKELY_TARGET_INDEXES (1-based, my best guess — verify against the message):
 {likely_targets}
 
@@ -232,7 +234,10 @@ class PropertyAnalystAgent(BaseAgent):
             card["zpid"] = L.zpid  # explicit — tools key on it
             cards.append(card)
 
+        from .shared_context import build_shared_context, shared_context_prompt_block
+        ctx = build_shared_context(session, current_agent=self.name)
         prompt = ANALYZE_PROMPT.format(
+            shared_context=shared_context_prompt_block(ctx),
             user_message=message,
             likely_targets=likely_indexes if likely_indexes else "(no clear ordinal — use your judgment)",
             listings=json.dumps(cards, indent=2, default=str),

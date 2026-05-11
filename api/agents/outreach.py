@@ -52,14 +52,21 @@ B) ASK — ONLY ask if USER_PROFILE.user_name is empty (required for the
    or use neutral phrasing in the email instead. The user's CURRENT
    message + listings are enough to draft once you have a name.
 
+{shared_context}
+
 USER_INTENT:
 {user_message}
 
-USER_PROFILE:
+USER_PROFILE (subset for email signature):
 {profile}
 
 LISTINGS:
 {listings}
+
+When the user_profile in SHARED CONTEXT lists must_haves (e.g. "parking
+under $200", "in-unit laundry", "13-week short-term lease"), include
+those as concrete questions in each email body so the leasing office
+addresses them directly.
 """
 
 
@@ -106,7 +113,10 @@ class OutreachAgent(BaseAgent):
             )
 
         from dataclasses import asdict
+        from .shared_context import build_shared_context, shared_context_prompt_block
+        ctx = build_shared_context(session, current_agent="outreach")
         prompt = DRAFT_PROMPT.format(
+            shared_context=shared_context_prompt_block(ctx),
             user_message=message,
             profile=json.dumps(
                 {

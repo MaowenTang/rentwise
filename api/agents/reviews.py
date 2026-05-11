@@ -95,9 +95,13 @@ or user is asking generally), respond with:
 _SUMMARIZE_PROMPT = """You are RentWise's Resident Reviews Agent. A prospective
 tenant is asking what current and past residents think of **{building_name}**.
 
+{shared_context}
+
 User's question: "{user_question}"
 
 Analyze the reviews below and write a structured resident sentiment summary.
+When the user_profile (above) lists must_haves like "quiet building" or
+"safe neighborhood", weight reviews mentioning those dimensions more.
 
 INSTRUCTIONS:
 1. **Lead with what's asked** — If the user asked about a specific dimension
@@ -314,7 +318,7 @@ class ResidentReviewsAgent(BaseAgent):
             source_links=source_links,
         )
 
-    def _summarize_reviews(self, building_name: str, records: list[dict], message: str = "") -> str:
+    def _summarize_reviews(self, building_name: str, records: list[dict], message: str = "", session=None) -> str:  # noqa: ANN001
         """Run Claude summarization over full review text, with category extraction."""
         all_reviews: list[dict] = []
         source_names: list[str] = []
@@ -350,7 +354,12 @@ class ResidentReviewsAgent(BaseAgent):
 
         source_links = " · ".join(link_parts) if link_parts else "the building's page directly"
 
+        from .shared_context import build_shared_context, shared_context_prompt_block
+        ctx_block = ""
+        if session is not None:
+            ctx_block = shared_context_prompt_block(build_shared_context(session, current_agent="reviews"))
         prompt = _SUMMARIZE_PROMPT.format(
+            shared_context=ctx_block,
             building_name=building_name,
             user_question=message or "What do residents say about this building?",
             today=str(date.today()),
@@ -419,7 +428,7 @@ class ResidentReviewsAgent(BaseAgent):
         # ── Step 5: full review text — Claude summarization ─────────────
         return AgentReply(
             agent=self.name,
-            text=self._summarize_reviews(building_name, records, message),
+            text=self._summarize_reviews(building_name, records, message, session=session),
             metadata={
                 "zpid": zpid,
                 "reviews_status": "full",
