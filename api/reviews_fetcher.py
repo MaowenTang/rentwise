@@ -69,6 +69,75 @@ ReviewsResult: TypeAlias = dict  # see schema in module docstring
 # In-memory cache (zpid → list[ReviewsResult])
 # ---------------------------------------------------------------------------
 _cache: dict[str, list[ReviewsResult]] = {}
+
+# Cross-namespace lookup index. Yelp/Google reviews are keyed by Zillow's
+# numeric zpid, but active listings often come from apartments.com (apt:*)
+# or Craigslist (cl_*). To still credit a Craigslist listing for "Miro
+# San Jose" with the existing Miro Yelp reviews, we build an index:
+#   normalized_building_name → list[(zpid, lat, lng)]
+# and look up by listing.name + lat/lng proximity.
+_review_name_index: dict[str, list[tuple[str, float | None, float | None]]] = {}
+_review_index_built: bool = False
+
+
+def _normalize_building_name(name: str) -> str:
+    """Lowercase + strip generic tokens so 'The Fay Apartments at San Jose'
+    and 'fay-san-jose' both reduce to 'fay'. Used for cross-namespace
+    review→listing matching.
+    """
+    import re
+    if not name:
+        return ""
+    s = name.lower()
+    # Strip Yelp URL city suffixes like "-san-jose", "-san-jose-2", "-oakland"
+    s = re.sub(r"-(san[- ]jose|san[- ]francisco|oakland|berkeley|bay[- ]area|sf)(-?\d+)?$", " ", s)
+    # Drop generic building-word tokens
+    s = re.sub(
+        r"\b(apartments?|homes?|residences?|apts?|tower|towers|at|the|of|and|by|in|on|"
+        r"furnished|luxury|new|co[- ]living|family|community|residential|rentals?)\b",
+        " ", s,
+    )
+    # Collapse non-alphanumeric to single space
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    tokens = s.split()
+    # Drop very short noise tokens (1-char), but keep 2+ char meaningful words
+    tokens = [t for t in tokens if len(t) >= 2]
+    return " ".join(tokens)
+
+
+def _build_review_name_index(listings_lookup: dict[str, tuple[float | None, float | None]] | None = None) -> None:
+    """Build review→building-name index. Called lazily on first
+    get_reviews_by_listing() call.
+
+    listings_lookup: optional dict zpid → (lat, lng) so we can attach
+    coordinates to each review for proximity verification. When None,
+    coords stay None and we fall back to name-match-only.
+    """
+    global _review_index_built
+    if _review_index_built:
+        return
+    import re
+    _load_cache()  # make sure _cache is populated first
+    for zpid, records in _cache.items():
+        for rec in records:
+            url = (rec.get("url") or "")
+            m = re.search(r"/biz/([^?/]+)", url)
+            if not m:
+                continue
+            raw = m.group(1)
+            norm = _normalize_building_name(raw)
+            if not norm:
+                continue
+            lat = lng = None
+            if listings_lookup:
+                lat, lng = listings_lookup.get(zpid, (None, None))
+            _review_name_index.setdefault(norm, []).append((zpid, lat, lng))
+    _review_index_built = True
+    LOG.info(
+        "Built review name index: %d unique normalized names from %d reviews",
+        len(_review_name_index),
+        sum(len(v) for v in _review_name_index.values()),
+    )
 _cache_loaded: bool = False
 
 
@@ -439,6 +508,71 @@ def get_reviews(zpid: str) -> list[ReviewsResult]:
     _load_cache()
     if _cache_is_fresh(zpid):
         return _cache[zpid]
+    return []
+
+
+def get_reviews_by_listing(
+    listing_zpid: str,
+    listing_name: str | None,
+    listing_lat: float | None = None,
+    listing_lng: float | None = None,
+    listings_lookup: dict[str, tuple[float | None, float | None]] | None = None,
+    max_distance_mi: float = 0.5,
+) -> list[ReviewsResult]:
+    """Cross-namespace review lookup.
+
+    1. Direct zpid hit (covers Zillow listings).
+    2. Building-name match (covers Craigslist/apartments.com listings whose
+       zpid namespace differs but which refer to the same building as a
+       cached Yelp/Google review). Optionally verified by haversine
+       distance < max_distance_mi.
+    Returns [] on no match.
+    """
+    _load_cache()
+    direct = _cache.get(listing_zpid) or []
+    if direct and _cache_is_fresh(listing_zpid):
+        return direct
+    if not listing_name:
+        return []
+    _build_review_name_index(listings_lookup)
+    norm = _normalize_building_name(listing_name)
+    if not norm:
+        return []
+    # Token-overlap match: normalize listing → check if any cached building
+    # has overlapping tokens (≥1 substantial token in common).
+    listing_tokens = set(norm.split())
+    if not listing_tokens:
+        return []
+    best_zpid: str | None = None
+    best_overlap: int = 0
+    best_distance: float | None = None
+    for rev_norm, entries in _review_name_index.items():
+        rev_tokens = set(rev_norm.split())
+        overlap = len(listing_tokens & rev_tokens)
+        if overlap == 0:
+            continue
+        # Pick the entry with closest geography if we have coords.
+        for zpid, lat, lng in entries:
+            if listing_lat is not None and lat is not None and listing_lng is not None and lng is not None:
+                from math import asin, cos, radians, sin, sqrt
+                p1, p2 = radians(listing_lat), radians(lat)
+                dlat = radians(lat - listing_lat)
+                dlng = radians(lng - listing_lng)
+                a = sin(dlat / 2) ** 2 + cos(p1) * cos(p2) * sin(dlng / 2) ** 2
+                d_mi = 2 * 3958.7613 * asin(sqrt(a))
+                if d_mi > max_distance_mi:
+                    continue  # name match but wrong building
+                if best_distance is None or d_mi < best_distance:
+                    best_distance = d_mi
+                    best_zpid = zpid
+                    best_overlap = overlap
+            else:
+                # No coords — accept name match (best-overlap wins)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_zpid = zpid
+    if best_zpid:
+        return _cache.get(best_zpid, [])
     return []
 
 

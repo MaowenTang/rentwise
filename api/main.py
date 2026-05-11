@@ -62,6 +62,16 @@ async def lifespan(app: FastAPI):
     STATE["ranker"] = ranker
     STATE["sessions"] = SessionStore()
     STATE["profile_updater"] = ProfileUpdater()
+
+    # Build cross-namespace review index so listings without direct cache
+    # hits (Craigslist cl_*, apartments.com apt:*) can still pick up
+    # reviews from buildings with matching names (verified by lat/lng).
+    try:
+        from reviews_fetcher import _build_review_name_index
+        zpid_to_coords = {L.zpid: (L.lat, L.lng) for L in listings if L.zpid}
+        _build_review_name_index(zpid_to_coords)
+    except Exception as e:
+        LOG.warning("review name-index build failed: %s", e)
     STATE["agents"] = {
         "search": SearchAgent(listings, ranker=ranker),
         # Property is the pilot for cross-agent tool-use; needs the full
