@@ -1,17 +1,19 @@
-"""SQLite database for users + persisted profiles + chat event log.
+"""Database backend for users + persisted profiles + chat event log.
 
-Schema kept intentionally minimal — single-file SQLite, no migrations
-framework. Tables:
+Backend selection:
+  • DATABASE_URL starts with "postgres://" or "postgresql://" → psycopg 3
+  • Otherwise (or unset) → SQLite at RENTWISE_DB_PATH or api/data/users.db
 
+All public functions in this module work identically against both
+backends. Internally we keep SQL written with `?` placeholders (SQLite
+style); for psycopg we translate them to `%s` on the fly. Both backends
+support `ON CONFLICT` upsert (Postgres 9.5+ / SQLite 3.24+).
+
+Tables:
   users          — auth credentials
-  user_profiles  — latest serialized UserProfile per user
-  chat_events    — append-only training log: every /chat turn + extracted
-                   profile diff + ranked zpids; later /events/click and
-                   /events/save calls write back which listing got the
-                   user's attention.
-
-All write ops are wrapped in short connections (sqlite is fine with that;
-the file lives in api/data/users.db).
+  user_profiles  — latest UserProfile + long-term memory per user
+  chat_events    — append-only training log
+  interaction_events — click/save/remove events
 """
 from __future__ import annotations
 
@@ -20,12 +22,24 @@ import os
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 DB_PATH = Path(os.environ.get("RENTWISE_DB_PATH") or (
     Path(__file__).resolve().parent / "data" / "users.db"
 ))
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+# Render gives postgres://; psycopg prefers postgresql://. Normalize.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+
+IS_POSTGRES = DATABASE_URL.startswith("postgresql://")
+
+if IS_POSTGRES:
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
 
 
 _SCHEMA = """
@@ -78,23 +92,87 @@ CREATE INDEX IF NOT EXISTS idx_interaction_events_user_ts ON interaction_events(
 """
 
 
-def _connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    return conn
+class _ConnWrap:
+    """Thin context-manager wrapper so the rest of db.py can `with _connect() as c:`
+    against either sqlite3.Connection or psycopg.Connection. Translates `?` →
+    `%s` placeholders for psycopg on the fly. Row factory returns dict-like
+    objects for both backends so `row["email"]` works uniformly.
+    """
+
+    def __init__(self):
+        if IS_POSTGRES:
+            self._conn = psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=False)
+        else:
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._conn = sqlite3.connect(str(DB_PATH), timeout=10.0)
+            self._conn.row_factory = sqlite3.Row
+        self._is_pg = IS_POSTGRES
+
+    def execute(self, sql: str, params: tuple = ()):
+        if self._is_pg:
+            sql = sql.replace("?", "%s")
+            cur = self._conn.cursor()
+            cur.execute(sql, params)
+            return cur
+        return self._conn.execute(sql, params)
+
+    def executescript(self, sql: str):
+        if self._is_pg:
+            # Postgres has no executescript — split on `;` and run each.
+            cur = self._conn.cursor()
+            for stmt in sql.split(";"):
+                if stmt.strip():
+                    cur.execute(stmt)
+            return cur
+        return self._conn.executescript(sql)
+
+    def commit(self):
+        self._conn.commit()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            try:
+                self._conn.commit()
+            except Exception:
+                pass
+        else:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        self._conn.close()
+
+
+def _connect() -> _ConnWrap:
+    return _ConnWrap()
 
 
 def init_db() -> None:
     """Create schema if not exists. Idempotent. Includes a tiny migration
     that adds memory_json column to user_profiles if pre-existing rows
     didn't have it (so the long-term-memory upgrade is non-breaking).
+
+    Schema is written to work on both SQLite and Postgres. `REAL` is
+    valid on SQLite and is a 32-bit float on Postgres — we use it for
+    Unix epoch seconds where 32-bit precision is fine.
     """
     with _connect() as conn:
         conn.executescript(_SCHEMA)
-        # Migration: older deploys created user_profiles without memory_json.
-        cols = [r[1] for r in conn.execute("PRAGMA table_info(user_profiles)").fetchall()]
-        if "memory_json" not in cols:
+        # Check whether memory_json column exists, then add if missing.
+        if IS_POSTGRES:
+            cur = conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = ? AND column_name = ?",
+                ("user_profiles", "memory_json"),
+            )
+            exists = bool(cur.fetchone())
+        else:
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(user_profiles)").fetchall()]
+            exists = "memory_json" in cols
+        if not exists:
             try:
                 conn.execute("ALTER TABLE user_profiles ADD COLUMN memory_json TEXT")
             except Exception:

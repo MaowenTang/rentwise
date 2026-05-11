@@ -473,11 +473,11 @@ def events_track(req: InteractionEvent, current_user=Depends(get_current_user_op
 
 @app.get("/events/my-history")
 def my_history(current_user=Depends(get_current_user), limit: int = 50):
-    """Authed user can see their own chat history (debugging / transparency)."""
-    import sqlite3
-    from db import DB_PATH
-    with sqlite3.connect(str(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
+    """Authed user can see their own chat history (debugging / transparency).
+    Uses the db._connect() wrapper so it works on both SQLite and Postgres.
+    """
+    from db import _connect
+    with _connect() as conn:
         rows = conn.execute(
             "SELECT id, session_id, timestamp, user_message, agent_id, "
             "       ranked_zpids_json "

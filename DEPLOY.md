@@ -12,6 +12,31 @@ Both have free trials; total monthly cost for testing-scale usage: ~$0–5.
 
 ---
 
+## Persistent user data — Postgres (recommended for Render)
+
+Render's free/starter dynos use ephemeral disk: any SQLite db at
+`api/data/users.db` is **wiped on every deploy and every restart**. To
+keep users + memory + chat-event training data across deploys, attach
+a managed Postgres:
+
+1. Render dashboard → **New +** → **PostgreSQL** → name it `rentwise-db`
+   (free tier OK to start; upgrade to $7/mo Starter for persistent
+   backups when you have real users).
+2. Once provisioned, copy the **Internal Database URL**
+   (starts with `postgresql://`).
+3. On your `rentwise-api-...` service → **Environment** → add:
+   ```
+   DATABASE_URL=postgresql://...
+   ```
+4. Save → Render auto-redeploys. On boot, `db.init_db()` creates the
+   four tables (users / user_profiles / chat_events / interaction_events)
+   in the new database. Anonymous chat traffic continues to work.
+
+Local dev keeps using SQLite at `api/data/users.db` automatically when
+`DATABASE_URL` is unset — no setup change needed.
+
+---
+
 ## Path A — GitHub-driven (recommended, ~30 min)
 
 Best because every `git push` auto-redeploys both services.
