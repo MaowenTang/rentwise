@@ -1929,6 +1929,17 @@ function MessageRow({
             }}
           />
         )}
+        {isMapEligible && (
+          <button
+            onClick={() => {
+              trackEventGlobal("show_more", null, null);
+              onChipTap("show me more");
+            }}
+            className="mt-3 text-xs font-medium px-3 py-1.5 rounded border border-emerald-700 text-emerald-700 hover:bg-emerald-50 transition-colors"
+          >
+            Show me more →
+          </button>
+        )}
         {m.toolCalls && m.toolCalls.length > 0 && (
           <ToolCallsFooter calls={m.toolCalls} />
         )}
