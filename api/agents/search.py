@@ -296,6 +296,14 @@ class SearchAgent(BaseAgent):
             loc = L.neighborhood or "—"
             url = L.url or ""
             rationale = L.raw.get("_rationale", "").strip()
+            # When Zillow hides the address and sets name to the placeholder,
+            # fall back to neighborhood so users see "Sunol-Midtown" not
+            # "(Undisclosed Address)" as the listing headline.
+            display_name = (
+                L.neighborhood or "Listing"
+                if not L.name or L.name.lower() == "(undisclosed address)"
+                else L.name
+            )
 
             beds_in_scope = sorted(L.rent_by_bed)
             if any_pref:
@@ -319,7 +327,7 @@ class SearchAgent(BaseAgent):
                     bed_lines.append(f"{label} rent ?")
             bed_str = " · ".join(bed_lines) if bed_lines else "rent ?"
 
-            lines.append(f"{i}. **{L.name}** · {loc}")
+            lines.append(f"{i}. **{display_name}** · {loc}")
             lines.append(f"   {bed_str}")
             if rationale:
                 lines.append(f"   {rationale}")
